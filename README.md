@@ -1,5 +1,5 @@
 # NVIDIA DreamZero: World Action Models Are Zero-Shot Policies
-A research project from [NVIDIA](https://www.nvidia.com/en-us/research/).
+A research project from [NVIDIA GEAR Lab](https://research.nvidia.com/labs/gear/).
 
 [[Project Page](https://dreamzero0.github.io/)] [[Paper](https://arxiv.org/abs/2602.15922)]
 
