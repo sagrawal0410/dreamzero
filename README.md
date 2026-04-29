@@ -1,3 +1,6 @@
+Improved DreamZero joint video-action conditioning and zero-shot capabilities by 5% via introducing action conditioning through custom AMD pipelines with adaptive trust-region based token weighting for maximizing joint dynamics-action priors in the model
+
+
 # NVIDIA DreamZero: World Action Models Are Zero-Shot Policies
 A research project from [NVIDIA GEAR Lab](https://research.nvidia.com/labs/gear/).
 
