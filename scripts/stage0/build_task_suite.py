@@ -171,23 +171,7 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
     task_map = _load_tasks_map(meta_dir)
     ep_meta = _load_episodes_meta(meta_dir, task_map)
 
-    # LeRobot fixes parquet layout to data/<chunk>/episode_*.parquet, so we walk it
-    # explicitly with os.scandir instead of a recursive `**` glob — the latter is
-    # painfully slow on network volumes (RunPod /workspace) because it stat()s
-    # every directory entry recursively.
-    data_root = dataset_root / "data"
-    parquets: list[str] = []
-    if data_root.is_dir():
-        with os.scandir(str(data_root)) as chunk_iter:
-            chunk_dirs = sorted(e.path for e in chunk_iter if e.is_dir())
-        for cd in chunk_dirs:
-            with os.scandir(cd) as f_iter:
-                for e in f_iter:
-                    if e.is_file() and e.name.startswith("episode_") and e.name.endswith(".parquet"):
-                        parquets.append(e.path)
-        parquets.sort()
-    else:
-        parquets = sorted(glob.glob(str(data_root / "**" / "episode_*.parquet"), recursive=True))
+    parquets = sorted(glob.glob(str(dataset_root / "data" / "**" / "episode_*.parquet"), recursive=True))
     if not parquets:
         raise FileNotFoundError(f"No episode_*.parquet found under {dataset_root}/data")
 
