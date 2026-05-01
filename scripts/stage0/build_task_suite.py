@@ -140,32 +140,67 @@ def _load_episodes_meta(meta_dir: Path, task_map: dict[int, str]) -> dict[int, d
     return out
 
 
-def _discover_videos(dataset_root: Path, episode_index: int, video_keys: tuple[str, ...]) -> dict[str, str]:
-    """Locate per-camera mp4 paths for an episode."""
-    mp4s: dict[str, str] = {}
+def _on_disk_camera_folder(video_key: str) -> str:
+    """Translate a policy modality key (`video.X`) to the on-disk camera folder
+    name (`observation.images.X`) used by the DreamZero-DROID-Data conversion.
+
+    Falls back to the raw key for datasets that already use it as the folder
+    name on disk.
+    """
+    if video_key.startswith("video."):
+        return "observation.images." + video_key[len("video."):]
+    return video_key
+
+
+def _build_video_index(dataset_root: Path, video_keys: tuple[str, ...]) -> dict[tuple[str, int], str]:
+    """Walk videos/ ONCE and return {(policy_video_key, episode_index): mp4_path}.
+
+    This replaces O(num_episodes × cameras) recursive globs with a single
+    rglob over videos/, which on a network volume is the difference between
+    minutes-to-hours and a few seconds.
+    """
     videos_root = dataset_root / "videos"
+    index: dict[tuple[str, int], str] = {}
     if not videos_root.exists():
-        return mp4s
-    fname = f"episode_{episode_index:06d}.mp4"
-    # The LeRobot layout puts cameras in subfolders that often look like
-    # `videos/chunk-XXX/<camera_key>/episode_XXXXXX.mp4` or just
-    # `videos/<camera_key>/...`. Glob for both.
-    for key in video_keys:
-        candidates = list(videos_root.glob(f"**/{key}/{fname}"))
-        if not candidates:
+        return index
+    folder_to_key = {_on_disk_camera_folder(k): k for k in video_keys}
+    pat = re.compile(r"episode_(\d+)\.mp4$")
+    for mp4 in videos_root.rglob("episode_*.mp4"):
+        m = pat.search(mp4.name)
+        if not m:
             continue
-        mp4s[key] = str(candidates[0].resolve())
-    return mp4s
+        cam_folder = mp4.parent.name
+        policy_key = folder_to_key.get(cam_folder)
+        if policy_key is None:
+            continue
+        index[(policy_key, int(m.group(1)))] = str(mp4.resolve())
+    return index
+
+
+def _video_paths_for_episode(index: dict[tuple[str, int], str],
+                             video_keys: tuple[str, ...],
+                             episode_index: int) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k in video_keys:
+        p = index.get((k, episode_index))
+        if p is not None:
+            out[k] = p
+    return out
 
 
 def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
-                       skip_videos: bool = False) -> list[EpisodeInfo]:
+                       quick: bool = False) -> list[EpisodeInfo]:
     """Walk the LeRobot dataset and return one EpisodeInfo per episode.
 
-    When `skip_videos` is True (used by --dry_run) we avoid the recursive video
-    glob and the per-episode parquet length reads. This drops dry-run from
-    O(num_episodes × tree_walk) to O(meta files only) — seconds instead of
-    tens of minutes on a network volume.
+    Video paths are NEVER discovered here — they are filled in later from the
+    one-shot `_build_video_index(...)` walk. This keeps discovery to:
+
+      - parquet glob (one filesystem call)
+      - meta/{episodes,tasks}.jsonl read
+      - optional parquet `num_rows` per episode (slow on network FS; skipped
+        when `quick=True`).
+
+    `quick=True` is used by --dry_run so the entire pre-flight runs in seconds.
     """
     meta_dir = dataset_root / "meta"
     task_map = _load_tasks_map(meta_dir)
@@ -175,10 +210,10 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
     if not parquets:
         raise FileNotFoundError(f"No episode_*.parquet found under {dataset_root}/data")
 
-    if skip_videos:
+    if quick:
         logger.info(
-            "Fast discovery: skipping video globs and parquet length reads "
-            "(dry-run only — manifest write would re-discover videos)."
+            "Fast discovery: skipping parquet length reads "
+            "(--dry_run only — full run reads them lazily for chosen episodes)."
         )
 
     episodes: list[EpisodeInfo] = []
@@ -191,7 +226,7 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
         ep_idx = int(m.group(1))
         meta = ep_meta.get(ep_idx, {})
         length = int(meta.get("length") or 0)
-        if length == 0 and not skip_videos:
+        if length == 0 and not quick:
             try:
                 import pyarrow.parquet as pq_reader
                 length = pq_reader.read_table(pq, columns=[]).num_rows
@@ -203,14 +238,13 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
         instruction = str(meta.get("instruction") or "")
         if not instruction:
             missing_instruction += 1
-        videos = {} if skip_videos else _discover_videos(dataset_root, ep_idx, video_keys)
         episodes.append(
             EpisodeInfo(
                 episode_index=ep_idx,
                 parquet_path=Path(pq),
                 length=length,
                 instruction=instruction,
-                video_paths=videos,
+                video_paths={},   # filled later from the video index
             )
         )
 
@@ -407,7 +441,7 @@ def build_suite(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Discovering episodes under %s ...", dataset_root)
-    episodes = _discover_episodes(dataset_root, DEFAULT_VIDEO_KEYS, skip_videos=args.dry_run)
+    episodes = _discover_episodes(dataset_root, DEFAULT_VIDEO_KEYS, quick=args.dry_run)
     logger.info("Found %d episodes.", len(episodes))
 
     grouped: dict[str, list[EpisodeInfo]] = {gname: [] for gname in groups}
@@ -442,6 +476,16 @@ def build_suite(args: argparse.Namespace) -> None:
         return
 
     # ------------------------------------------------------------------
+    # Build a one-shot videos/ index. We do this AFTER classification
+    # (which doesn't need videos) so a misconfigured task_groups.yaml
+    # short-circuits via --dry_run before paying for the rglob.
+    # ------------------------------------------------------------------
+    logger.info("Building video index (one rglob over videos/) ...")
+    video_index = _build_video_index(dataset_root, DEFAULT_VIDEO_KEYS)
+    logger.info("  indexed %d (camera, episode) pairs covering %d unique episodes",
+                len(video_index), len({e for _, e in video_index.keys()}))
+
+    # ------------------------------------------------------------------
     # Sample manifest: Group -> Task -> Episode -> Timestep
     # ------------------------------------------------------------------
     chosen_groups = list(groups.keys())
@@ -452,6 +496,8 @@ def build_suite(args: argparse.Namespace) -> None:
     by_group: dict[str, list[dict[str, Any]]] = {}
     structure: dict[str, dict[str, Any]] = {}     # diagnostic per-group counts
     next_id = 0
+    skipped_no_videos = 0
+    skipped_no_length = 0
 
     for gname in chosen_groups:
         by_instr = dict(tasks_per_group.get(gname, {}))
@@ -484,8 +530,31 @@ def build_suite(args: argparse.Namespace) -> None:
             for ep_idx_in_task, ep in enumerate(chosen_eps):
                 if legacy_eps_per_group is not None and chosen_episodes_count >= legacy_eps_per_group:
                     break
+
+                # Lazy parquet length read for chosen episodes whose meta
+                # didn't carry it. Cheap because we only read num_rows.
                 if ep.length <= 0:
+                    try:
+                        import pyarrow.parquet as pq_reader
+                        ep.length = int(pq_reader.read_table(str(ep.parquet_path), columns=[]).num_rows)
+                    except Exception as e:
+                        logger.warning("Skipping ep %d: cannot read length (%s)", ep.episode_index, e)
+                        skipped_no_length += 1
+                        continue
+                if ep.length <= 0:
+                    skipped_no_length += 1
                     continue
+
+                # Look up videos in the prebuilt index. Skip episode if any
+                # required camera is missing — downstream scripts assume all
+                # three streams are present.
+                video_paths = _video_paths_for_episode(
+                    video_index, DEFAULT_VIDEO_KEYS, ep.episode_index
+                )
+                if len(video_paths) < len(DEFAULT_VIDEO_KEYS):
+                    skipped_no_videos += 1
+                    continue
+
                 t_indices = _stratified_indices(ep.length, fractions)
                 sa = _read_state_action(
                     ep.parquet_path,
@@ -520,7 +589,7 @@ def build_suite(args: argparse.Namespace) -> None:
                         "episode_index_in_task": ep_idx_in_task,
                         "frame_index": int(t),
                         "role": role,
-                        "video_paths": ep.video_paths,
+                        "video_paths": video_paths,
                         "state_columns": list(DEFAULT_STATE_COLUMNS),
                         "action_columns": list(DEFAULT_ACTION_COLUMNS),
                         "state_at_t": sa[t]["state"],
@@ -534,7 +603,7 @@ def build_suite(args: argparse.Namespace) -> None:
 
                     if args.save_preview:
                         _save_preview(
-                            ep.video_paths,
+                            video_paths,
                             t,
                             output_dir / "preview" / f"{example_id}.png",
                         )
@@ -556,6 +625,15 @@ def build_suite(args: argparse.Namespace) -> None:
             len(by_group[gname]),
         )
 
+    if skipped_no_videos:
+        logger.warning(
+            "Skipped %d episodes that had no matching videos in the on-disk index. "
+            "(Are all three cameras present under videos/<chunk>/observation.images.*/?)",
+            skipped_no_videos,
+        )
+    if skipped_no_length:
+        logger.warning("Skipped %d episodes whose length could not be determined.", skipped_no_length)
+
     summary = {
         "dataset_root": str(dataset_root),
         "task_groups_config": str(cfg_path),
@@ -572,6 +650,8 @@ def build_suite(args: argparse.Namespace) -> None:
         "action_horizon": args.action_horizon,
         "include_unmatched": include_unmatched,
         "random_seed": seed,
+        "skipped_no_videos": skipped_no_videos,
+        "skipped_no_length": skipped_no_length,
         "instruction_histogram_top20": dict(
             sorted(instruction_hist.items(), key=lambda kv: kv[1], reverse=True)[:20]
         ),
