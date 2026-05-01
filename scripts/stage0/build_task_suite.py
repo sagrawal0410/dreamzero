@@ -290,6 +290,21 @@ def _classify_episode(instruction: str, groups: dict[str, dict[str, Any]]) -> st
     return None
 
 
+def _is_lfs_pointer_file(path: Path, *, sniff: int = 200) -> bool:
+    """Return True if `path` is a git-lfs pointer stub instead of real content.
+
+    LFS pointers are short text files starting with the literal
+    `version https://git-lfs.github.com/spec/`. We only read the first ~200
+    bytes so this is essentially free.
+    """
+    try:
+        with path.open("rb") as f:
+            head = f.read(sniff)
+    except Exception:
+        return False
+    return head.startswith(b"version https://git-lfs.github.com/spec/")
+
+
 # ----------------------------------------------------------------------------
 # Timestep sampling and ground-truth extraction
 # ----------------------------------------------------------------------------
@@ -342,10 +357,42 @@ def _read_state_action(parquet_path: Path,
                        state_columns: tuple[str, ...],
                        action_columns: tuple[str, ...],
                        action_horizon: int) -> dict[int, dict[str, Any]]:
-    """Return {frame_index: {'state': flat np, 'gt_action_chunk': (H, A) np}}."""
+    """Return {frame_index: {'state': flat np, 'gt_action_chunk': (H, A) np}}.
+
+    Returns an empty dict if the parquet is missing, an LFS pointer, truncated,
+    or otherwise unreadable. The caller treats empty results as "skip this
+    episode" instead of crashing.
+    """
     import pyarrow.parquet as pq
 
-    table = pq.read_table(str(parquet_path))
+    # Cheap pre-flight: detect LFS pointers and any non-parquet file before
+    # PyArrow throws a less-helpful schema error from deep in the C++ layer.
+    try:
+        with parquet_path.open("rb") as f:
+            head = f.read(8)
+    except Exception as e:
+        logger.warning("Cannot open parquet %s: %s", parquet_path, e)
+        return {}
+    if head.startswith(b"version https://git-lfs.github.com/spec/"[:8]):
+        logger.warning(
+            "Skipping %s: file is a git-lfs POINTER. Run `git lfs pull "
+            "--include 'data/**/*.parquet'` in the cloned repo.",
+            parquet_path,
+        )
+        return {}
+    if not head.startswith(b"PAR1"):
+        logger.warning(
+            "Skipping %s: not a valid parquet file (magic=%r). May be "
+            "truncated or partially downloaded.",
+            parquet_path, head,
+        )
+        return {}
+
+    try:
+        table = pq.read_table(str(parquet_path))
+    except Exception as e:
+        logger.warning("Skipping %s: pyarrow read failed (%s)", parquet_path, e)
+        return {}
     n = table.num_rows
     cols = set(table.column_names)
 
@@ -515,6 +562,7 @@ def build_suite(args: argparse.Namespace) -> None:
     next_id = 0
     skipped_no_videos = 0
     skipped_no_length = 0
+    skipped_bad_parquet = 0
 
     for gname in chosen_groups:
         by_instr = dict(tasks_per_group.get(gname, {}))
@@ -580,6 +628,10 @@ def build_suite(args: argparse.Namespace) -> None:
                     DEFAULT_ACTION_COLUMNS,
                     args.action_horizon,
                 )
+                if not sa:
+                    # Parquet was an LFS pointer / corrupt / unreadable.
+                    skipped_bad_parquet += 1
+                    continue
                 # Stable short hash for the task instruction (8 hex chars)
                 import hashlib
                 task_hash = hashlib.sha1((task_text or "").encode("utf-8")).hexdigest()[:8]
@@ -650,6 +702,12 @@ def build_suite(args: argparse.Namespace) -> None:
         )
     if skipped_no_length:
         logger.warning("Skipped %d episodes whose length could not be determined.", skipped_no_length)
+    if skipped_bad_parquet:
+        logger.warning(
+            "Skipped %d episodes whose parquet was unreadable (LFS pointer / "
+            "truncated / corrupt). Run `git lfs pull --include 'data/**/*.parquet'`.",
+            skipped_bad_parquet,
+        )
 
     summary = {
         "dataset_root": str(dataset_root),
@@ -669,6 +727,7 @@ def build_suite(args: argparse.Namespace) -> None:
         "random_seed": seed,
         "skipped_no_videos": skipped_no_videos,
         "skipped_no_length": skipped_no_length,
+        "skipped_bad_parquet": skipped_bad_parquet,
         "instruction_histogram_top20": dict(
             sorted(instruction_hist.items(), key=lambda kv: kv[1], reverse=True)[:20]
         ),

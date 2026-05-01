@@ -62,6 +62,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from _common import (  # noqa: E402
     EMBODIMENT_TAG,
+    FrameReadError,
     build_obs,
     init_dist_single_process,
     reset_causal_state,
@@ -398,15 +399,16 @@ def run_audit(args: argparse.Namespace) -> None:
     if not manifest:
         raise RuntimeError(f"Empty manifest at {manifest_path}")
 
+    # Build an ordered candidate list. We try to read frames lazily so a single
+    # corrupt MP4 (truncated, missing moov atom, etc.) just falls through to
+    # the next candidate instead of crashing the whole audit.
     if args.example_id is not None:
         candidates = [e for e in manifest if e.get("example_id") == args.example_id]
         if not candidates:
             raise KeyError(f"example_id={args.example_id} not in manifest")
-        entry = candidates[0]
     else:
-        idx = max(0, min(args.example_index, len(manifest) - 1))
-        entry = manifest[idx]
-    logger.info("Auditing example: %s (frame=%d)", entry["example_id"], entry["frame_index"])
+        start = max(0, min(args.example_index, len(manifest) - 1))
+        candidates = manifest[start:] + manifest[:start]
 
     init_dist_single_process()
 
@@ -421,7 +423,26 @@ def run_audit(args: argparse.Namespace) -> None:
     hook_records, handles = install_hooks(head)
     logger.info("Hooked %d modules.", len(handles))
 
-    obs = build_obs(entry)
+    entry = None
+    obs = None
+    for cand in candidates:
+        try:
+            obs = build_obs(cand)
+            entry = cand
+            break
+        except FrameReadError as e:
+            logger.warning("Skipping %s — %s", cand.get("example_id"), e)
+        except Exception as e:
+            logger.warning("Skipping %s — unexpected error: %s", cand.get("example_id"), e)
+    if entry is None or obs is None:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        raise RuntimeError("No usable example found in manifest (all candidate MP4s failed to read).")
+    logger.info("Auditing example: %s (frame=%d)", entry["example_id"], entry["frame_index"])
+
     reset_causal_state(policy)
 
     torch.manual_seed(0)

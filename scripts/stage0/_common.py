@@ -40,14 +40,21 @@ def init_dist_single_process() -> None:
     dist.init_process_group(backend="gloo", world_size=1, rank=0)
 
 
+class FrameReadError(RuntimeError):
+    """Raised when an MP4 frame cannot be decoded (truncated file, missing moov, etc.)."""
+
+
 def read_frame(mp4_path: str, frame_index: int) -> np.ndarray:
     import cv2
     cap = cv2.VideoCapture(mp4_path)
+    if not cap.isOpened():
+        cap.release()
+        raise FrameReadError(f"Could not open MP4 (likely corrupt / truncated): {mp4_path}")
     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
     ok, frame = cap.read()
     cap.release()
     if not ok:
-        raise RuntimeError(f"Failed to read frame {frame_index} from {mp4_path}")
+        raise FrameReadError(f"Failed to read frame {frame_index} from {mp4_path}")
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
 
@@ -56,12 +63,15 @@ def build_obs(entry: dict[str, Any]) -> dict[str, Any]:
 
     First-call AR_droid format: T=1 frame per camera, state is (1, D), prompt
     is a Python string under LANGUAGE_KEY.
+
+    Raises FrameReadError if any per-camera MP4 cannot be decoded so callers
+    can `try/except` and skip the example instead of crashing the whole run.
     """
     obs: dict[str, Any] = {}
     for key in VIDEO_KEYS:
         mp4 = entry["video_paths"].get(key)
         if mp4 is None:
-            raise KeyError(f"Manifest entry missing video for {key}: {entry['example_id']}")
+            raise FrameReadError(f"Manifest entry missing video for {key}: {entry['example_id']}")
         frame = read_frame(mp4, entry["frame_index"])
         obs[key] = frame[np.newaxis, ...].astype(np.uint8)
 
