@@ -160,6 +160,13 @@ def _discover_videos(dataset_root: Path, episode_index: int, video_keys: tuple[s
 
 def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
                        skip_videos: bool = False) -> list[EpisodeInfo]:
+    """Walk the LeRobot dataset and return one EpisodeInfo per episode.
+
+    When `skip_videos` is True (used by --dry_run) we avoid the recursive video
+    glob and the per-episode parquet length reads. This drops dry-run from
+    O(num_episodes × tree_walk) to O(meta files only) — seconds instead of
+    tens of minutes on a network volume.
+    """
     meta_dir = dataset_root / "meta"
     task_map = _load_tasks_map(meta_dir)
     ep_meta = _load_episodes_meta(meta_dir, task_map)
@@ -168,7 +175,15 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
     if not parquets:
         raise FileNotFoundError(f"No episode_*.parquet found under {dataset_root}/data")
 
+    if skip_videos:
+        logger.info(
+            "Fast discovery: skipping video globs and parquet length reads "
+            "(dry-run only — manifest write would re-discover videos)."
+        )
+
     episodes: list[EpisodeInfo] = []
+    missing_length = 0
+    missing_instruction = 0
     for pq in parquets:
         m = re.search(r"episode_(\d+)\.parquet$", pq)
         if not m:
@@ -183,7 +198,11 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
             except Exception as e:
                 logger.warning("Unable to read length for episode %d (%s); skipping. (%s)", ep_idx, pq, e)
                 continue
+        if length == 0:
+            missing_length += 1
         instruction = str(meta.get("instruction") or "")
+        if not instruction:
+            missing_instruction += 1
         videos = {} if skip_videos else _discover_videos(dataset_root, ep_idx, video_keys)
         episodes.append(
             EpisodeInfo(
@@ -197,6 +216,12 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
 
     if not episodes:
         raise RuntimeError(f"No usable episodes discovered in {dataset_root}.")
+    if missing_length:
+        logger.info("  episodes with no `length` in meta/episodes.jsonl: %d "
+                    "(dry-run keeps them; full run would re-read parquet rows)", missing_length)
+    if missing_instruction:
+        logger.info("  episodes with no language instruction in meta: %d "
+                    "(these will land in the `unmatched` group)", missing_instruction)
     return episodes
 
 
