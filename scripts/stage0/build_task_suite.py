@@ -158,7 +158,8 @@ def _discover_videos(dataset_root: Path, episode_index: int, video_keys: tuple[s
     return mp4s
 
 
-def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...]) -> list[EpisodeInfo]:
+def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
+                       skip_videos: bool = False) -> list[EpisodeInfo]:
     meta_dir = dataset_root / "meta"
     task_map = _load_tasks_map(meta_dir)
     ep_meta = _load_episodes_meta(meta_dir, task_map)
@@ -175,7 +176,7 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...]) -> list[
         ep_idx = int(m.group(1))
         meta = ep_meta.get(ep_idx, {})
         length = int(meta.get("length") or 0)
-        if length == 0:
+        if length == 0 and not skip_videos:
             try:
                 import pyarrow.parquet as pq_reader
                 length = pq_reader.read_table(pq, columns=[]).num_rows
@@ -183,13 +184,14 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...]) -> list[
                 logger.warning("Unable to read length for episode %d (%s); skipping. (%s)", ep_idx, pq, e)
                 continue
         instruction = str(meta.get("instruction") or "")
+        videos = {} if skip_videos else _discover_videos(dataset_root, ep_idx, video_keys)
         episodes.append(
             EpisodeInfo(
                 episode_index=ep_idx,
                 parquet_path=Path(pq),
                 length=length,
                 instruction=instruction,
-                video_paths=_discover_videos(dataset_root, ep_idx, video_keys),
+                video_paths=videos,
             )
         )
 
@@ -320,7 +322,7 @@ def build_suite(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Discovering episodes under %s ...", dataset_root)
-    episodes = _discover_episodes(dataset_root, DEFAULT_VIDEO_KEYS)
+    episodes = _discover_episodes(dataset_root, DEFAULT_VIDEO_KEYS, skip_videos=args.dry_run)
     logger.info("Found %d episodes.", len(episodes))
 
     grouped: dict[str, list[EpisodeInfo]] = {gname: [] for gname in groups}
