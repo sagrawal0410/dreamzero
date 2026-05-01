@@ -1,0 +1,96 @@
+# Stage 0 task-group definitions for E0.0 (Dataset and Task-Suite Setup).
+#
+# Each top-level key is a group name. Each group has a list of `keywords` that
+# are matched (case-insensitive substring) against the per-episode language
+# instruction in the LeRobot dataset (`meta/tasks.jsonl`). Episodes whose
+# instruction contains *any* keyword from a group are eligible for that group.
+#
+# An episode is assigned to the FIRST group (in the order below) it matches.
+# Episodes that match no group are placed in the `unmatched` bucket and can be
+# kept (`include_unmatched: true`) or dropped.
+#
+# Edit the keyword lists to reflect what is actually present in your dataset's
+# language instructions. You can preview matched counts by running
+# `scripts/stage0/build_task_suite.py --dry_run`.
+
+# ----------------------------------------------------------------------------
+# Group A: easy object-centric tasks (sanity)
+#   - confirm model runs / actions are reasonable / generated futures sane
+# ----------------------------------------------------------------------------
+A_easy_object:
+  description: "Easy object-centric tasks (pick, place, move to target)."
+  keywords:
+    - "pick up"
+    - "pick the"
+    - "place the"
+    - "put the"
+    - "move the"
+    - "grasp the"
+
+# ----------------------------------------------------------------------------
+# Group B: contact-sensitive tasks (CRITICAL for action-causal maps)
+#   - opening, sliding, inserting, handles, rims, thin/flat objects
+# ----------------------------------------------------------------------------
+B_contact_sensitive:
+  description: "Contact-sensitive tasks (handles, rims, insert, slide, push)."
+  keywords:
+    - "open the drawer"
+    - "open the door"
+    - "close the drawer"
+    - "close the door"
+    - "by the handle"
+    - "push"
+    - "slide"
+    - "insert"
+    - "plug"
+    - "press"
+    - "flip"
+
+# ----------------------------------------------------------------------------
+# Group C: distractor / clutter tasks
+#   - target among similar distractors / cluttered tabletop / occlusion
+# ----------------------------------------------------------------------------
+C_distractor:
+  description: "Distractor or cluttered scenes."
+  keywords:
+    - "among"
+    - "next to"
+    - "between"
+    - "behind"
+    - "left of"
+    - "right of"
+    - "cluttered"
+
+# ----------------------------------------------------------------------------
+# Group D: global-context tasks
+#   - place into distant container / avoid obstacle / table edge / push to zone
+# ----------------------------------------------------------------------------
+D_global_context:
+  description: "Global-context tasks (distant containers, table edges, zones, obstacles)."
+  keywords:
+    - "into the bin"
+    - "into the box"
+    - "into the bowl"
+    - "to the edge"
+    - "to the corner"
+    - "across the table"
+    - "avoid"
+    - "around"
+
+# ----------------------------------------------------------------------------
+# Suite sampling defaults (overridden by CLI flags)
+# ----------------------------------------------------------------------------
+sampling:
+  num_episodes_per_group: 8
+  num_timesteps_per_episode: 5
+  # Stratified time fractions inside each episode (in [0, 1)).
+  # Ordered as: initial, approach, pre-contact, contact, post-contact / placement.
+  timestep_fractions: [0.05, 0.30, 0.55, 0.75, 0.92]
+  timestep_role_names:
+    - initial
+    - approach
+    - pre_contact
+    - contact
+    - post_contact
+  include_unmatched: false
+  random_seed: 0
