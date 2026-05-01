@@ -94,12 +94,29 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
-    with path.open("r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
+    text = path.read_text()
+    if text.startswith("version https://git-lfs.github.com/spec/"):
+        raise RuntimeError(
+            f"{path} is a git-lfs POINTER file (~150 bytes), not the real "
+            f"metadata. Inside the cloned repo run:\n"
+            f"    git config --unset lfs.skip-smudge   # if needed\n"
+            f"    git lfs install\n"
+            f"    git lfs pull --include 'meta/*'\n"
+            f"Then re-run this script."
+        )
+    bad = 0
+    for i, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
             rows.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            bad += 1
+            if bad <= 3:
+                logger.warning("%s:%d not valid JSON, skipping (%s)", path.name, i, e)
+    if bad:
+        logger.warning("%s: skipped %d unparseable lines", path.name, bad)
     return rows
 
 
