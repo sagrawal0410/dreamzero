@@ -6,30 +6,20 @@
 # instruction contains *any* keyword from a group are eligible for that group.
 #
 # An episode is assigned to the FIRST group (in the order below) it matches.
-# Episodes that match no group are placed in the `unmatched` bucket and can be
-# kept (`include_unmatched: true`) or dropped.
+# Order is intentional: the more specific groups (B–E) come BEFORE the broad
+# Group A (easy / catch-all) so that "place the cube into the bin" is routed
+# to D rather than swallowed by A's "place the". Episodes that match no group
+# are placed in the `unmatched` bucket and can be kept
+# (`include_unmatched: true`) or dropped.
 #
 # Edit the keyword lists to reflect what is actually present in your dataset's
 # language instructions. You can preview matched counts by running
 # `scripts/stage0/build_task_suite.py --dry_run`.
 
 # ----------------------------------------------------------------------------
-# Group A: easy object-centric tasks (sanity)
-#   - confirm model runs / actions are reasonable / generated futures sane
-# ----------------------------------------------------------------------------
-A_easy_object:
-  description: "Easy object-centric tasks (pick, place, move to target)."
-  keywords:
-    - "pick up"
-    - "pick the"
-    - "place the"
-    - "put the"
-    - "move the"
-    - "grasp the"
-
-# ----------------------------------------------------------------------------
 # Group B: contact-sensitive tasks (CRITICAL for action-causal maps)
 #   - opening, sliding, inserting, handles, rims, thin/flat objects
+#   Listed first because handle / contact phrasing is highly specific.
 # ----------------------------------------------------------------------------
 B_contact_sensitive:
   description: "Contact-sensitive tasks (handles, rims, insert, slide, push)."
@@ -76,6 +66,51 @@ D_global_context:
     - "across the table"
     - "avoid"
     - "around"
+
+# ----------------------------------------------------------------------------
+# Group E: static-background / temporal-redundancy tasks
+#   - gripper-led motion against a mostly-fixed background scene
+#   - object often already grasped; the rest of the world barely changes
+#   - PRIMARY purpose: validate previous-frame cache perturbations.
+#     A static-background region should tolerate caching with negligible
+#     action delta; a moving object/gripper region should not.
+# ----------------------------------------------------------------------------
+E_static_background:
+  description: "Static-background / temporal-redundancy tasks (gripper-led motion against a fixed scene; for previous-frame cache experiments)."
+  keywords:
+    - "stack"
+    - "pour"
+    - "fold"
+    - "wipe"
+    - "wash"
+    - "clean"
+    - "sweep"
+    - "scrub"
+    - "stir"
+    - "hand over"
+    - "hand it"
+    - "hand to"
+    - "place on top"
+    - "put on top"
+    - "set down"
+    - "rest the"
+    - "hold the"
+
+# ----------------------------------------------------------------------------
+# Group A: easy object-centric tasks (sanity / catch-all)
+#   - confirm model runs / actions are reasonable / generated futures sane
+#   Listed LAST so that the more specific groups B–E claim their episodes
+#   first. A then catches the broad pick / place / move phrasing.
+# ----------------------------------------------------------------------------
+A_easy_object:
+  description: "Easy object-centric tasks (pick, place, move to target)."
+  keywords:
+    - "pick up"
+    - "pick the"
+    - "place the"
+    - "put the"
+    - "move the"
+    - "grasp the"
 
 # ----------------------------------------------------------------------------
 # Suite sampling defaults (overridden by CLI flags)
