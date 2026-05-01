@@ -113,19 +113,32 @@ A_easy_object:
     - "grasp the"
 
 # ----------------------------------------------------------------------------
-# Suite sampling defaults (overridden by CLI flags)
+# Suite sampling defaults (overridden by CLI flags).
+#
+# Sampling hierarchy: Group -> unique Task (instruction) -> Episode -> Timestep.
+# A "task" is a distinct natural-language instruction inside a group; this
+# matters because Group A can hold many tasks ("pick up the cube",
+# "place the cup", ...) and you usually want diversity across tasks rather
+# than over-sampling one task with many episodes.
+#
+# At full size (defaults below): 5 groups × 25 tasks × 10 episodes × 12
+# timesteps ≈ 15 000 examples. Cap any of these CLI flags down for smoke
+# runs:
+#   --num_tasks_per_group 5 --num_episodes_per_task 3 --num_timesteps_per_episode 5
 # ----------------------------------------------------------------------------
 sampling:
-  num_episodes_per_group: 8
-  num_timesteps_per_episode: 5
-  # Stratified time fractions inside each episode (in [0, 1)).
-  # Ordered as: initial, approach, pre-contact, contact, post-contact / placement.
-  timestep_fractions: [0.05, 0.30, 0.55, 0.75, 0.92]
-  timestep_role_names:
-    - initial
-    - approach
-    - pre_contact
-    - contact
-    - post_contact
+  num_tasks_per_group: 25
+  num_episodes_per_task: 10
+  num_timesteps_per_episode: 12
+
+  # If timestep_fractions / timestep_role_names are omitted (or shorter than
+  # num_timesteps_per_episode) the script auto-generates linearly stratified
+  # fractions in [0.05, 0.92] and the default phase labels below in order:
+  # initial, early_approach, mid_approach, approach, pre_contact, contact,
+  # post_contact, transport_start, transport_mid, transport_late, near_target,
+  # completion, settle, release, retreat (extra phases get phase_NN).
+  timestep_fractions: []      # empty -> auto-generate
+  timestep_role_names: []     # empty -> auto-generate
+
   include_unmatched: false
   random_seed: 0

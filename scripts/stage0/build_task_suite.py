@@ -253,6 +253,39 @@ def _stratified_indices(length: int, fractions: list[float]) -> list[int]:
     return out
 
 
+def _default_fractions(n: int) -> list[float]:
+    """Linearly stratified fractions in [0.05, 0.92] for `n` timesteps."""
+    if n <= 0:
+        return []
+    if n == 1:
+        return [0.5]
+    return [0.05 + (0.92 - 0.05) * i / (n - 1) for i in range(n)]
+
+
+def _default_roles(n: int) -> list[str]:
+    """Human-readable role labels matching the stratified fractions above."""
+    base = [
+        "initial",
+        "early_approach",
+        "mid_approach",
+        "approach",
+        "pre_contact",
+        "contact",
+        "post_contact",
+        "transport_start",
+        "transport_mid",
+        "transport_late",
+        "near_target",
+        "completion",
+        "settle",
+        "release",
+        "retreat",
+    ]
+    if n <= len(base):
+        return list(base[:n])
+    return [f"phase_{i:02d}" for i in range(n)]
+
+
 def _read_state_action(parquet_path: Path,
                        frame_indices: list[int],
                        state_columns: tuple[str, ...],
@@ -331,11 +364,38 @@ def build_suite(args: argparse.Namespace) -> None:
     sampling_cfg = full_cfg.pop("sampling", {}) or {}
     groups = full_cfg
 
-    num_eps = int(args.num_episodes_per_group or sampling_cfg.get("num_episodes_per_group", 8))
-    num_ts = int(args.num_timesteps_per_episode or sampling_cfg.get("num_timesteps_per_episode", 5))
-    fractions = list(sampling_cfg.get("timestep_fractions", [0.05, 0.30, 0.55, 0.75, 0.92]))[:num_ts]
-    role_names = list(sampling_cfg.get("timestep_role_names",
-                                        ["initial", "approach", "pre_contact", "contact", "post_contact"]))[:num_ts]
+    # Hierarchy is Group -> unique Task (instruction) -> Episode -> Timestep.
+    # Sampling parameters (CLI overrides YAML; YAML overrides hard-coded defaults).
+    num_tasks = int(
+        args.num_tasks_per_group
+        if args.num_tasks_per_group is not None
+        else sampling_cfg.get("num_tasks_per_group", 25)
+    )
+    num_eps_per_task = int(
+        args.num_episodes_per_task
+        if args.num_episodes_per_task is not None
+        else sampling_cfg.get("num_episodes_per_task", 10)
+    )
+    # Legacy: if the user passed --num_episodes_per_group, we still honour it
+    # by setting an upper bound on (num_tasks * num_eps_per_task) per group.
+    legacy_eps_per_group = (
+        int(args.num_episodes_per_group)
+        if args.num_episodes_per_group is not None
+        else sampling_cfg.get("num_episodes_per_group")
+    )
+
+    num_ts = int(
+        args.num_timesteps_per_episode
+        if args.num_timesteps_per_episode is not None
+        else sampling_cfg.get("num_timesteps_per_episode", 12)
+    )
+    fractions_cfg = sampling_cfg.get("timestep_fractions") or []
+    role_names_cfg = sampling_cfg.get("timestep_role_names") or []
+    fractions = list(fractions_cfg)[:num_ts] if len(fractions_cfg) >= num_ts else _default_fractions(num_ts)
+    role_names = list(role_names_cfg)[:num_ts] if len(role_names_cfg) >= num_ts else _default_roles(num_ts)
+    fractions = fractions[:num_ts]
+    role_names = role_names[:num_ts]
+
     include_unmatched = bool(sampling_cfg.get("include_unmatched", False))
     seed = int(args.random_seed if args.random_seed is not None else sampling_cfg.get("random_seed", 0))
 
@@ -359,72 +419,142 @@ def build_suite(args: argparse.Namespace) -> None:
         gname = _classify_episode(instr, groups)
         grouped.setdefault(gname or "unmatched", []).append(ep)
 
-    logger.info("Group counts (eligible episodes):")
+    # Per-group: count distinct tasks (unique instruction strings).
+    tasks_per_group: dict[str, dict[str, list[EpisodeInfo]]] = {}
     for gname, eps in grouped.items():
-        logger.info("  %-22s %d", gname, len(eps))
+        by_instr: dict[str, list[EpisodeInfo]] = {}
+        for ep in eps:
+            by_instr.setdefault(ep.instruction or "", []).append(ep)
+        tasks_per_group[gname] = by_instr
+
+    logger.info(
+        "Plan: up to %d tasks/group × %d episodes/task × %d timesteps/episode",
+        num_tasks, num_eps_per_task, num_ts,
+    )
+    logger.info("Group breakdown (eligible episodes / unique tasks):")
+    for gname in list(grouped.keys()):
+        eps = grouped[gname]
+        n_tasks = len(tasks_per_group[gname])
+        logger.info("  %-22s episodes=%-7d unique_tasks=%-5d", gname, len(eps), n_tasks)
 
     if args.dry_run:
         logger.info("--dry_run: not writing manifest.")
         return
 
-    # Pick episodes per group and timesteps per episode
+    # ------------------------------------------------------------------
+    # Sample manifest: Group -> Task -> Episode -> Timestep
+    # ------------------------------------------------------------------
     chosen_groups = list(groups.keys())
     if include_unmatched:
         chosen_groups.append("unmatched")
 
     manifest: list[dict[str, Any]] = []
     by_group: dict[str, list[dict[str, Any]]] = {}
+    structure: dict[str, dict[str, Any]] = {}     # diagnostic per-group counts
     next_id = 0
 
     for gname in chosen_groups:
-        eps = list(grouped.get(gname, []))
-        rng.shuffle(eps)
-        eps = eps[:num_eps]
-        by_group[gname] = []
-        for ep in eps:
-            if ep.length <= 0:
-                continue
-            t_indices = _stratified_indices(ep.length, fractions)
-            sa = _read_state_action(
-                ep.parquet_path,
-                t_indices,
-                DEFAULT_STATE_COLUMNS,
-                DEFAULT_ACTION_COLUMNS,
-                args.action_horizon,
-            )
-            for t, role in zip(t_indices, role_names):
-                if t not in sa:
-                    continue
-                example_id = f"{gname}__ep{ep.episode_index:06d}__t{t:05d}__{role}"
-                next_id += 1
-                entry = {
-                    "example_id": example_id,
-                    "global_index": next_id - 1,
-                    "task_group": gname,
-                    "task_name": (groups.get(gname, {}) or {}).get("description", gname),
-                    "instruction": ep.instruction,
-                    "episode_index": ep.episode_index,
-                    "episode_path": str(ep.parquet_path),
-                    "episode_length": ep.length,
-                    "frame_index": int(t),
-                    "role": role,
-                    "video_paths": ep.video_paths,
-                    "state_columns": list(DEFAULT_STATE_COLUMNS),
-                    "action_columns": list(DEFAULT_ACTION_COLUMNS),
-                    "state_at_t": sa[t]["state"],
-                    "gt_action_chunk": sa[t]["gt_action_chunk"],
-                    "action_horizon": args.action_horizon,
-                    "suite_seed": seed,
-                }
-                manifest.append(entry)
-                by_group[gname].append(entry)
+        by_instr = dict(tasks_per_group.get(gname, {}))
+        # Skip empty-instruction bucket inside a group only if the group is matched
+        # (matched groups should never have a "" instruction key after classify).
+        tasks = [t for t in by_instr.keys() if t]
+        # Allow empty-instruction tasks to flow through only for `unmatched`.
+        if gname == "unmatched":
+            tasks = list(by_instr.keys())
 
-                if args.save_preview:
-                    _save_preview(
-                        ep.video_paths,
-                        t,
-                        output_dir / "preview" / f"{example_id}.png",
+        rng.shuffle(tasks)
+        chosen_tasks = tasks[:num_tasks]
+        if len(tasks) < num_tasks:
+            logger.warning(
+                "Group %s: only %d unique tasks available (requested %d).",
+                gname, len(tasks), num_tasks,
+            )
+
+        by_group[gname] = []
+        per_task_counts: dict[str, int] = {}
+        chosen_episodes_count = 0
+
+        for task_idx, task_text in enumerate(chosen_tasks):
+            task_eps = list(by_instr.get(task_text, []))
+            rng.shuffle(task_eps)
+            chosen_eps = task_eps[:num_eps_per_task]
+            if legacy_eps_per_group is not None and chosen_episodes_count >= legacy_eps_per_group:
+                break
+
+            for ep_idx_in_task, ep in enumerate(chosen_eps):
+                if legacy_eps_per_group is not None and chosen_episodes_count >= legacy_eps_per_group:
+                    break
+                if ep.length <= 0:
+                    continue
+                t_indices = _stratified_indices(ep.length, fractions)
+                sa = _read_state_action(
+                    ep.parquet_path,
+                    t_indices,
+                    DEFAULT_STATE_COLUMNS,
+                    DEFAULT_ACTION_COLUMNS,
+                    args.action_horizon,
+                )
+                # Stable short hash for the task instruction (8 hex chars)
+                import hashlib
+                task_hash = hashlib.sha1((task_text or "").encode("utf-8")).hexdigest()[:8]
+                wrote_any = False
+                for t, role in zip(t_indices, role_names):
+                    if t not in sa:
+                        continue
+                    example_id = (
+                        f"{gname}__task{task_idx:03d}_{task_hash}__"
+                        f"ep{ep.episode_index:06d}__t{t:05d}__{role}"
                     )
+                    next_id += 1
+                    entry = {
+                        "example_id": example_id,
+                        "global_index": next_id - 1,
+                        "task_group": gname,
+                        "task_name": (groups.get(gname, {}) or {}).get("description", gname),
+                        "task_index_in_group": task_idx,
+                        "task_hash": task_hash,
+                        "instruction": ep.instruction,
+                        "episode_index": ep.episode_index,
+                        "episode_path": str(ep.parquet_path),
+                        "episode_length": ep.length,
+                        "episode_index_in_task": ep_idx_in_task,
+                        "frame_index": int(t),
+                        "role": role,
+                        "video_paths": ep.video_paths,
+                        "state_columns": list(DEFAULT_STATE_COLUMNS),
+                        "action_columns": list(DEFAULT_ACTION_COLUMNS),
+                        "state_at_t": sa[t]["state"],
+                        "gt_action_chunk": sa[t]["gt_action_chunk"],
+                        "action_horizon": args.action_horizon,
+                        "suite_seed": seed,
+                    }
+                    manifest.append(entry)
+                    by_group[gname].append(entry)
+                    wrote_any = True
+
+                    if args.save_preview:
+                        _save_preview(
+                            ep.video_paths,
+                            t,
+                            output_dir / "preview" / f"{example_id}.png",
+                        )
+                if wrote_any:
+                    chosen_episodes_count += 1
+                    per_task_counts[task_text] = per_task_counts.get(task_text, 0) + 1
+
+        structure[gname] = {
+            "num_unique_tasks_available": len(by_instr),
+            "num_unique_tasks_chosen": len(chosen_tasks),
+            "num_episodes_total": chosen_episodes_count,
+            "episodes_per_task": per_task_counts,
+        }
+        logger.info(
+            "  %-22s tasks=%d episodes=%d examples=%d",
+            gname,
+            len(chosen_tasks),
+            chosen_episodes_count,
+            len(by_group[gname]),
+        )
 
     summary = {
         "dataset_root": str(dataset_root),
@@ -432,8 +562,11 @@ def build_suite(args: argparse.Namespace) -> None:
         "num_examples": len(manifest),
         "num_groups": len(chosen_groups),
         "examples_per_group": {g: len(by_group.get(g, [])) for g in chosen_groups},
-        "num_episodes_per_group": num_eps,
+        "structure_per_group": structure,
+        "num_tasks_per_group_target": num_tasks,
+        "num_episodes_per_task_target": num_eps_per_task,
         "num_timesteps_per_episode": num_ts,
+        "legacy_num_episodes_per_group_cap": legacy_eps_per_group,
         "timestep_fractions": fractions,
         "timestep_role_names": role_names,
         "action_horizon": args.action_horizon,
@@ -459,10 +592,15 @@ def main() -> None:
                    help="YAML file with task-group keyword definitions and sampling defaults.")
     p.add_argument("--output_dir", required=True,
                    help="Directory to write manifest.json / summary.json / preview frames into.")
-    p.add_argument("--num_episodes_per_group", type=int, default=None,
-                   help="Episodes to sample per group (default: from YAML).")
+    p.add_argument("--num_tasks_per_group", type=int, default=None,
+                   help="Distinct task instructions to sample per group (default: from YAML, fallback 25).")
+    p.add_argument("--num_episodes_per_task", type=int, default=None,
+                   help="Episodes (trajectories) to sample per unique task (default: from YAML, fallback 10).")
     p.add_argument("--num_timesteps_per_episode", type=int, default=None,
-                   help="Timesteps to sample per episode (default: from YAML).")
+                   help="Timesteps to sample per episode (default: from YAML, fallback 12).")
+    p.add_argument("--num_episodes_per_group", type=int, default=None,
+                   help="LEGACY: hard cap on total episodes per group "
+                        "(if set, num_tasks_per_group × num_episodes_per_task is truncated).")
     p.add_argument("--action_horizon", type=int, default=DEFAULT_ACTION_HORIZON,
                    help="Number of future action steps to record as ground-truth chunk.")
     p.add_argument("--random_seed", type=int, default=None,
@@ -470,7 +608,7 @@ def main() -> None:
     p.add_argument("--save_preview", action="store_true",
                    help="Save a preview frame per example under <output_dir>/preview/.")
     p.add_argument("--dry_run", action="store_true",
-                   help="Print group counts only; do not write manifest.")
+                   help="Print group / task counts only; do not write manifest.")
     args = p.parse_args()
     try:
         build_suite(args)
