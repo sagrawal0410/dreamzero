@@ -21,19 +21,34 @@ We also record `perturbation_norm_relative_i^M = ||z_i' - z_i|| / ||z_i||`
 so the analysis script can produce both raw and norm-normalised heatmaps.
 
 This script is **GPU heavy** — it does `num_blocks * num_operators` forward
-passes per example. Use `--block_size N` (default 1) for a coarser grid,
-`--num_examples K` and `--max_blocks B` to bound runtime, and reduce
-`--operators` to fewer choices for fast iteration.
+passes per example. Use `--block_size TxHxW` for a coarser grid (e.g.
+`2x4x4` cuts work by 32× vs `1x1x1`), `--num_examples K` and `--max_blocks B`
+to bound runtime, and reduce `--operators` to fewer choices for fast iteration.
 
-Example (full pass, ~1.5 h for 8 examples on H100):
+Single-GPU example (8 examples, ~30 h on one H100 with block_size=2x4x4
+and 8 operators on the standard DROID 13×32×60 latent grid):
 
     python scripts/stage1/causal_maps_compute.py \\
         --checkpoint /workspace/checkpoints/DreamZero-DROID \\
         --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 8 \\
+        --num_examples 8 --phase_balanced \\
         --operators local_mean,blur_k3,prev_frame_cache_l1,zero_mask \\
         --alpha 1.0 \\
-        --block_size 1 \\
+        --block_size 2x4x4 \\
+        --output_dir runs/stage1_maps
+
+Multi-GPU example (same workload, ~3.75 h on 8 H100s — examples are
+sharded round-robin across ranks; each rank loads its own model copy
+and writes to its own per-example output directory):
+
+    torchrun --standalone --nproc_per_node=8 \\
+        scripts/stage1/causal_maps_compute.py \\
+        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
+        --task_suite runs/stage0_suite/manifest.json \\
+        --num_examples 8 --phase_balanced \\
+        --operators local_mean,blur_k3,prev_frame_cache_l1,zero_mask \\
+        --alpha 1.0 \\
+        --block_size 2x4x4 \\
         --output_dir runs/stage1_maps
 
 Smoke (fast) example (~6 min):
@@ -41,7 +56,7 @@ Smoke (fast) example (~6 min):
     python scripts/stage1/causal_maps_compute.py \\
         --checkpoint /workspace/checkpoints/DreamZero-DROID \\
         --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 2 --operators local_mean --block_size 2 \\
+        --num_examples 2 --operators local_mean --block_size 2x2x2 \\
         --output_dir runs/stage1_maps_smoke
 
 Per-example output layout:
@@ -51,6 +66,20 @@ Per-example output layout:
         baseline_input.png              — first camera view at frame_index
         baseline_decoded.png            — VAE-decoded baseline ys (sanity)
         heatmaps.npz                    — operator × metric × (T,H,W) arrays
+
+Multi-GPU notes:
+    - Run with `torchrun --nproc_per_node=N` (or set RANK/WORLD_SIZE/
+      LOCAL_RANK manually). Each rank processes `chosen[rank::world_size]`,
+      so example-level parallelism caps at `--num_examples`.
+    - Each rank loads its own model copy on `cuda:LOCAL_RANK` and runs
+      forward passes independently — there are no collective ops in the
+      hot loop, so multi-GPU scaling is essentially linear up to N=K.
+    - The `dataset_mean_lat` pre-pass is computed independently on every
+      rank over the *full* chosen list, so all ranks use the same
+      replacement target. Overhead is small (one forward pass per
+      example per rank).
+    - Only rank 0 writes the run-level `compute_run.json`, by scanning
+      each example's per-directory `meta.json` after a `dist.barrier()`.
 """
 
 from __future__ import annotations
@@ -87,7 +116,6 @@ from groot.vla.model.n1_5.sim_policy import GrootSimPolicy  # noqa: E402
 from _common import (  # noqa: E402
     EMBODIMENT_TAG,
     build_obs,
-    init_dist_single_process,
     read_frame,
     reset_causal_state,
 )
@@ -412,6 +440,44 @@ def compute_example(policy: GrootSimPolicy,
 
 
 # ============================================================================
+# Distributed init (single- and multi-GPU)
+# ============================================================================
+
+
+def _init_distributed() -> tuple[int, int, int]:
+    """Initialise torch.distributed for either single- or multi-GPU runs.
+
+    Honours `RANK`, `WORLD_SIZE`, `LOCAL_RANK` set by `torchrun`; falls
+    back to a 1-rank single-process group when those are not set. Pins
+    the current CUDA device to `LOCAL_RANK` when running multi-GPU.
+
+    The model itself does **no** collective ops in this script — each
+    rank simply runs its own forward passes on its own GPU. We still use
+    a (potentially multi-rank) gloo group so we can `dist.barrier()` at
+    the end before rank 0 assembles the run-level manifest. Gloo also
+    matches the original single-process initialisation in `_common.py`,
+    keeping behaviour bit-identical when `world_size == 1`.
+
+    Returns:
+        (rank, world_size, local_rank)
+    """
+    import torch.distributed as dist
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group(backend="gloo", world_size=world_size, rank=rank)
+
+    if torch.cuda.is_available() and world_size > 1:
+        torch.cuda.set_device(local_rank)
+
+    return rank, world_size, local_rank
+
+
+# ============================================================================
 # Driver
 # ============================================================================
 
@@ -478,69 +544,114 @@ def main() -> None:
         logger.error("Manifest is empty.")
         sys.exit(1)
 
-    init_dist_single_process()
-    logger.info("Loading model from %s ...", args.checkpoint)
+    # ------------------------------------------------------------------
+    # Multi-GPU setup. Under torchrun each rank gets a slice of `chosen`
+    # via round-robin sharding (preserves the phase-balanced ordering).
+    # When run as a plain `python ...` invocation this falls back to a
+    # 1-rank world and behaves exactly like before.
+    # ------------------------------------------------------------------
+    rank, world_size, local_rank = _init_distributed()
+    rank_tag = f"[rank {rank}/{world_size}]"
+
+    device = args.device
+    if torch.cuda.is_available() and world_size > 1:
+        device = f"cuda:{local_rank}"
+
+    my_chosen = chosen[rank::world_size]
+    logger.info("%s using device=%s; processing %d/%d examples: %s",
+                rank_tag, device, len(my_chosen), len(chosen),
+                [e["example_id"] for e in my_chosen])
+
+    logger.info("%s loading model from %s ...", rank_tag, args.checkpoint)
     policy = GrootSimPolicy(
         embodiment_tag=EmbodimentTag(EMBODIMENT_TAG),
         model_path=args.checkpoint,
-        device=args.device,
+        device=device,
     )
-    logger.info("Model loaded.")
+    logger.info("%s model loaded.", rank_tag)
 
     # Pre-pass: capture baselines to compute dataset_mean_lat (only if needed).
+    # NOTE: every rank computes this independently over the **full** chosen
+    # list so all ranks use the same replacement target. This is a few
+    # forward passes per rank (one per chosen example) — negligible vs
+    # the per-block sweep — and avoids needing to broadcast a tensor
+    # across ranks.
     needs_dataset_mean = any(
         "dataset_mean_lat" in (STAGE1_OPERATORS[o].get("needs", []) or []) for o in operators
     )
     dataset_mean_lat: torch.Tensor | None = None
     if needs_dataset_mean:
-        logger.info("Computing dataset_mean_lat across %d examples ...", len(chosen))
+        logger.info("%s computing dataset_mean_lat across %d examples ...",
+                    rank_tag, len(chosen))
         baselines: list[ps.BaselineCache] = []
         for entry in chosen:
             try:
                 obs = build_obs(entry)
                 baselines.append(ps.capture_baseline(policy, obs, args.seed))
             except Exception as e:
-                logger.warning("baseline capture failed for %s: %s", entry.get("example_id"), e)
+                logger.warning("%s baseline capture failed for %s: %s",
+                               rank_tag, entry.get("example_id"), e)
         if baselines:
             dataset_mean_lat = ps.compute_dataset_mean(baselines)
-            logger.info("dataset_mean_lat shape=%s", list(dataset_mean_lat.shape) if dataset_mean_lat is not None else None)
+            logger.info("%s dataset_mean_lat shape=%s", rank_tag,
+                        list(dataset_mean_lat.shape) if dataset_mean_lat is not None else None)
 
-    # Per-example sweep
-    all_meta: list[dict[str, Any]] = []
-    for i, entry in enumerate(chosen):
+    # Per-example sweep over this rank's shard.
+    for i, entry in enumerate(my_chosen):
         ex_dir = out_dir / entry["example_id"]
         if args.skip_existing and (ex_dir / "heatmaps.npz").exists():
-            logger.info("[%d/%d] skipping %s (already computed)", i + 1, len(chosen), entry["example_id"])
-            try:
-                all_meta.append(json.loads((ex_dir / "meta.json").read_text()))
-            except Exception:
-                pass
+            logger.info("%s [%d/%d] skipping %s (already computed)",
+                        rank_tag, i + 1, len(my_chosen), entry["example_id"])
             continue
-        logger.info("[%d/%d] computing causal map for %s ...", i + 1, len(chosen), entry["example_id"])
+        logger.info("%s [%d/%d] computing causal map for %s ...",
+                    rank_tag, i + 1, len(my_chosen), entry["example_id"])
         try:
-            meta = compute_example(
+            compute_example(
                 policy=policy, entry=entry, operators=operators, alpha=args.alpha,
                 block_size=block_size, seed=args.seed, max_blocks=args.max_blocks,
                 out_dir=ex_dir, dataset_mean_lat=dataset_mean_lat,
             )
-            all_meta.append(meta)
         except Exception as e:
-            logger.error("compute_example failed for %s: %s", entry["example_id"], e, exc_info=True)
+            logger.error("%s compute_example failed for %s: %s",
+                         rank_tag, entry["example_id"], e, exc_info=True)
             continue
 
-    # Run-level manifest (for the analysis script)
-    (out_dir / "compute_run.json").write_text(json.dumps({
-        "checkpoint": args.checkpoint,
-        "task_suite": args.task_suite,
-        "operators": operators,
-        "alpha": args.alpha,
-        "block_size": list(block_size),
-        "seed": args.seed,
-        "num_examples_completed": len([m for m in all_meta if not m.get("skipped")]),
-        "num_examples_requested": len(chosen),
-        "examples": all_meta,
-    }, indent=2))
-    logger.info("All examples done. Manifest -> %s", out_dir / "compute_run.json")
+    # Wait for every rank to finish writing its per-example outputs.
+    if world_size > 1:
+        import torch.distributed as dist
+        logger.info("%s done with shard, waiting for siblings ...", rank_tag)
+        dist.barrier()
+
+    # Only rank 0 writes the run-level manifest, by scanning disk for
+    # everyone's per-example meta.json files. This keeps cross-rank
+    # coordination out of the hot loop.
+    if rank == 0:
+        all_meta: list[dict[str, Any]] = []
+        for entry in chosen:
+            ex_dir = out_dir / entry["example_id"]
+            meta_path = ex_dir / "meta.json"
+            if not meta_path.exists():
+                logger.warning("Missing meta.json for %s — example was skipped or failed.",
+                               entry["example_id"])
+                continue
+            try:
+                all_meta.append(json.loads(meta_path.read_text()))
+            except Exception as e:
+                logger.warning("Could not load %s: %s", meta_path, e)
+
+        (out_dir / "compute_run.json").write_text(json.dumps({
+            "checkpoint": args.checkpoint,
+            "task_suite": args.task_suite,
+            "operators": operators,
+            "alpha": args.alpha,
+            "block_size": list(block_size),
+            "seed": args.seed,
+            "world_size": world_size,
+            "num_examples_completed": len([m for m in all_meta if not m.get("skipped")]),
+            "num_examples_requested": len(chosen),
+            "examples": all_meta,
+        }, indent=2))
+        logger.info("All examples done. Manifest -> %s", out_dir / "compute_run.json")
 
 
 if __name__ == "__main__":
