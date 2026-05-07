@@ -346,13 +346,15 @@ def plot_subset_action(rows: list[dict[str, Any]], out_dir: Path,
                        task_group: str, variant: str,
                        fname: str, title: str) -> dict[str, Any]:
     import matplotlib.pyplot as plt
+    out_dir.mkdir(parents=True, exist_ok=True)
     sub = [r for r in rows if r.get("task_group") == task_group]
     if variant:
         sub = _filter(sub, variant=variant)
     methods = _ordered_methods(_key_in(sub, "method"))
     budgets = sorted(_key_in(sub, "budget_pct"))
     if not methods or not budgets:
-        return {"skipped": True}
+        return {"skipped": True, "reason": f"no rows for task_group={task_group} (variant={variant})",
+                "n_examples": 0}
     palette = _palette_for_methods(methods)
     styles = _styles_for_methods(methods)
     fig, ax = plt.subplots(figsize=(6.0, 3.4))
