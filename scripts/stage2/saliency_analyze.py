@@ -135,6 +135,22 @@ def _to_2d(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _align_shapes(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Resize whichever 2-D map is smaller to match the larger spatial shape.
+
+    Stage-1 maps are produced at the *block grid* (e.g. 1x4x4 → 11×20) while
+    Stage-2 saliency proxies are always at the full latent grid (e.g. 44×80).
+    All Stage-2 comparison metrics (IoU, Pearson, Spearman, recall) require a
+    common shape, so we upsample the coarser one to match the finer one.
+    """
+    if a.shape == b.shape:
+        return a, b
+    target = a.shape if (a.size >= b.size) else b.shape
+    a2 = _resize_2d(a, target) if a.shape != target else a
+    b2 = _resize_2d(b, target) if b.shape != target else b
+    return a2, b2
+
+
 def _normalize(arr: np.ndarray) -> np.ndarray:
     a = np.nan_to_num(arr.astype(np.float64), nan=0.0)
     a = a - a.min()
@@ -271,9 +287,10 @@ def compute_overlap_table(examples: list[ExampleData], k_pct: float) -> list[dic
     for ex in examples:
         if ex.action_causal is None:
             continue
-        ac_2d = _to_2d(ex.action_causal)
+        ac_2d_raw = _to_2d(ex.action_causal)
         for proxy_name, proxy in ex.saliency.items():
-            p_2d = _to_2d(proxy)
+            p_2d_raw = _to_2d(proxy)
+            ac_2d, p_2d = _align_shapes(ac_2d_raw, p_2d_raw)
             iou = _iou(_top_k_mask(ac_2d, k_pct), _top_k_mask(p_2d, k_pct))
             pearson = _pearson(ac_2d, p_2d)
             spearman = _spearman(ac_2d, p_2d)
@@ -402,10 +419,11 @@ def find_failure_examples(examples: list[ExampleData], k_pct: float,
     for ex in examples:
         if ex.action_causal is None or not ex.saliency:
             continue
-        ac = _to_2d(ex.action_causal)
+        ac_raw = _to_2d(ex.action_causal)
         ious = []
         for proxy in ex.saliency.values():
-            ious.append(_iou(_top_k_mask(ac, k_pct), _top_k_mask(_to_2d(proxy), k_pct)))
+            ac, p = _align_shapes(ac_raw, _to_2d(proxy))
+            ious.append(_iou(_top_k_mask(ac, k_pct), _top_k_mask(p, k_pct)))
         ious = [v for v in ious if v is not None and not math.isnan(v)]
         if not ious:
             continue
