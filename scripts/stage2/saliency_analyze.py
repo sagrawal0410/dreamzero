@@ -634,6 +634,15 @@ def main() -> None:
     p.add_argument("--max_rows", type=int, default=6,
                    help="Number of rows in Figure 2.")
     p.add_argument("--max_failures", type=int, default=6)
+    p.add_argument("--require_action_causal", action="store_true", default=True,
+                   help="Drop examples that have no Stage-1 action-causal map "
+                        "(default True, so per-proxy comparisons are like-for-like).")
+    p.add_argument("--no_require_action_causal", dest="require_action_causal",
+                   action="store_false",
+                   help="Keep all Stage-2 examples even if Stage-1 didn't cover them.")
+    p.add_argument("--example_ids", default="",
+                   help="Optional comma-separated list (or @path/to/file.txt) of "
+                        "example_ids to KEEP. Anything not on the list is dropped.")
     args = p.parse_args()
 
     out_dir = Path(args.output_dir).resolve()
@@ -653,6 +662,32 @@ def main() -> None:
             examples.append(ex)
     logger.info("Loaded %d examples (%d with action-causal maps)",
                 len(examples), sum(1 for e in examples if e.action_causal is not None))
+
+    # Optional explicit example-id allow-list (file path with @prefix, or inline list).
+    if args.example_ids:
+        spec = args.example_ids.strip()
+        if spec.startswith("@"):
+            with Path(spec[1:]).open("r") as f:
+                allowlist = {line.strip() for line in f if line.strip()}
+        else:
+            allowlist = {s.strip() for s in spec.split(",") if s.strip()}
+        before = len(examples)
+        examples = [e for e in examples if e.example_id in allowlist]
+        missing = allowlist - {e.example_id for e in examples}
+        logger.info("Allow-list filter: %d -> %d examples (missing from saliency_dir: %d)",
+                    before, len(examples), len(missing))
+        if missing:
+            for m in sorted(missing):
+                logger.warning("  not found: %s", m)
+
+    # Drop examples without an action-causal map by default so all metrics,
+    # figures, and counts are like-for-like.
+    if args.require_action_causal:
+        before = len(examples)
+        examples = [e for e in examples if e.action_causal is not None]
+        if before != len(examples):
+            logger.info("Filtered to %d examples with action-causal maps (was %d).",
+                        len(examples), before)
 
     if not examples:
         sys.exit(1)
