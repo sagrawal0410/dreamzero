@@ -1,38 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 1 / Analyze — Paper-ready figures and tables for E1.1 – E1.5.
+"""Stage 1 analyze: Figures and sparsity stats from Stage 1 heatmaps.
 
-Reads the per-example heatmap arrays produced by `causal_maps_compute.py` and
-emits every Stage-1 deliverable:
-
-    E1.1 — Spatial action-causal heatmaps   per example, per operator.
-    E1.2 — Future-video sensitivity heatmaps per example, per operator.
-    E1.3 — Phase analysis (importance shifts over the rollout).
-    E1.4 — Task-type analysis (sparsity differs by task family).
-    E1.5 — Sparsity statistics (top-k mass, Gini, entropy).
-    Figure 1 — input | edge-saliency | action-causal | future-contact.
-
-All figures are written as PNG **and** PDF at 300 DPI with serif fonts
-(`configure_neurips_matplotlib`). All tables are written as CSV. A single
-`combined_report.md` ties everything together with embedded figure links and
-the headline numbers in the paper-appendix style.
-
-Run only after the compute script:
-
-    python scripts/stage1/causal_maps_analyze.py \\
-        --maps_dir runs/stage1_maps \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --noise_floor runs/stage0_stability/noise_floor.json \\
-        --output_dir runs/stage1_analysis
-
-Optional flags:
-
-    --primary_operator local_mean    # which operator drives Figure 1 / sparsity
-    --primary_metric action_l2       # action sensitivity used as default heatmap
-    --primary_video_metric video_l2  # future-video sensitivity used in Figure 1
-    --top_k_pcts 5,10,20,30          # sparsity cumulative levels to report
-    --highlight_examples ID1,ID2,…   # IDs to feature in Figure 1 (default: top sparsity)
-
-This script is **CPU-only**: no model load, no GPU. Iterates quickly.
+Produces action-causal maps, phase/task breakdowns, and paper-ready summary tables.
 """
 
 from __future__ import annotations
@@ -52,16 +21,10 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("stage1.analyze")
 
-# Local helpers (matplotlib config)
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGE0_DIR = SCRIPT_DIR.parent / "stage0"
 sys.path.insert(0, str(STAGE0_DIR))
 from _common import configure_neurips_matplotlib  # noqa: E402
-
-
-# ============================================================================
-# Heatmap data record
-# ============================================================================
 
 
 @dataclass
@@ -130,11 +93,6 @@ def _heatmap_2d(example: ExampleMaps, op: str, metric: str) -> np.ndarray | None
     return h2
 
 
-# ============================================================================
-# Sparsity metrics
-# ============================================================================
-
-
 def _normalize_nonneg(arr: np.ndarray) -> np.ndarray:
     a = arr.astype(np.float64).flatten()
     a = a[~np.isnan(a)]
@@ -175,11 +133,6 @@ def _normalized_entropy(arr: np.ndarray) -> float:
     eps = 1e-12
     H = -float(np.sum(p * np.log(p + eps)))
     return H / math.log(p.size + eps)
-
-
-# ============================================================================
-# Plotting primitives
-# ============================================================================
 
 
 def _save_fig(fig, base: Path) -> None:
@@ -242,11 +195,6 @@ def _overlay_heatmap(ax, base_rgb: np.ndarray | None, heatmap: np.ndarray,
         cb.ax.tick_params(labelsize=7)
 
 
-# ============================================================================
-# E1.1 — per-example action-causal heatmap figures
-# ============================================================================
-
-
 def figure_e1_1(example: ExampleMaps, out_dir: Path,
                 metrics: list[str]) -> None:
     """Per-example: input | (op × metric) heatmap grid."""
@@ -281,11 +229,6 @@ def figure_e1_1(example: ExampleMaps, out_dir: Path,
     _save_fig(fig, out_dir / f"heatmap_{example.example_id}")
 
 
-# ============================================================================
-# E1.2 — future-video sensitivity figures
-# ============================================================================
-
-
 def figure_e1_2(example: ExampleMaps, out_dir: Path,
                 video_metric: str = "video_l2") -> None:
     import matplotlib.pyplot as plt
@@ -310,11 +253,6 @@ def figure_e1_2(example: ExampleMaps, out_dir: Path,
     fig.suptitle(f"E1.2 — future-video sensitivity   {example.example_id}", fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     _save_fig(fig, out_dir / f"video_{example.example_id}")
-
-
-# ============================================================================
-# E1.3 — phase analysis
-# ============================================================================
 
 
 PHASE_ORDER = ["initial", "approach", "pre_contact", "contact", "post_contact"]
@@ -345,7 +283,6 @@ def figure_e1_3(examples: list[ExampleMaps], out_dir: Path,
     for phase, arrs in by_phase.items():
         phase_means[phase] = (np.mean(np.stack(arrs, axis=0), axis=0) if arrs else None)
 
-    # Plot phase × heatmap row
     cols = len(PHASE_ORDER)
     fig, axes = plt.subplots(1, cols, figsize=(2.7 * cols, 2.6))
     for i, phase in enumerate(PHASE_ORDER):
@@ -359,7 +296,6 @@ def figure_e1_3(examples: list[ExampleMaps], out_dir: Path,
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     _save_fig(fig, out_dir / "phase_avg_heatmap")
 
-    # Centroid drift: compute (h, w) centroid of importance per phase
     centroids: dict[str, tuple[float, float] | None] = {}
     for phase, mean in phase_means.items():
         if mean is None:
@@ -374,7 +310,6 @@ def figure_e1_3(examples: list[ExampleMaps], out_dir: Path,
         cx = float((m * xs).sum() / m.sum()) / max(1, W - 1)
         centroids[phase] = (cy, cx)
 
-    # Plot centroid drift on a unit grid
     fig, ax = plt.subplots(figsize=(4.4, 4.4))
     cmap = plt.get_cmap("viridis")
     pts = []
@@ -397,11 +332,6 @@ def figure_e1_3(examples: list[ExampleMaps], out_dir: Path,
 
     return {"phase_counts": {p: len(by_phase[p]) for p in PHASE_ORDER},
             "centroids_normalized_yx": centroids}
-
-
-# ============================================================================
-# E1.4 — task-type analysis
-# ============================================================================
 
 
 def figure_e1_4(examples: list[ExampleMaps], out_dir: Path,
@@ -434,7 +364,6 @@ def figure_e1_4(examples: list[ExampleMaps], out_dir: Path,
             "gini_mean": float(np.mean(ginis)),
             "entropy_mean": float(np.mean(ents)),
         })
-    # Bar chart of top-k mass per task
     if rows:
         labels = [r["task_group"] for r in rows]
         means = [r["top_k_mass_mean"] for r in rows]
@@ -451,7 +380,6 @@ def figure_e1_4(examples: list[ExampleMaps], out_dir: Path,
         fig.tight_layout()
         _save_fig(fig, out_dir / "sparsity_per_task")
 
-    # Representative heatmap per task — pick the example with highest top-k mass.
     for task, exs in sorted(by_task.items()):
         best: ExampleMaps | None = None; best_score = -1.0
         for ex in exs:
@@ -476,11 +404,6 @@ def figure_e1_4(examples: list[ExampleMaps], out_dir: Path,
         _save_fig(fig, out_dir / f"representative_{task}")
 
     return {"top_k_pct": top_k_pct, "rows": rows}
-
-
-# ============================================================================
-# E1.5 — sparsity statistics
-# ============================================================================
 
 
 def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
@@ -510,7 +433,6 @@ def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
     if not flats:
         return {"skipped": True}
 
-    # Cumulative-importance curves (Lorenz-style, but on sorted descending p)
     fig, ax = plt.subplots(figsize=(5.4, 3.2))
     cmap = plt.get_cmap("magma")
     cum_avg = None; n_examples = 0
@@ -528,7 +450,6 @@ def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
     if cum_avg is not None:
         ax.plot(np.linspace(0, 1, 100), cum_avg / n_examples, color="black", lw=2.0,
                 label=f"mean over {n_examples} examples")
-    # Reference: uniform = y = x
     ax.plot([0, 1], [0, 1], "--", color="grey", lw=0.8, label="uniform (no sparsity)")
     ax.set_xlabel("fraction of latents (sorted by importance)")
     ax.set_ylabel("cumulative importance mass")
@@ -537,7 +458,6 @@ def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
     fig.tight_layout()
     _save_fig(fig, out_dir / "cumulative_importance")
 
-    # Top-k mass curves: x = k%, y = mean top-k mass over examples
     pct_grid = np.array([1, 2, 5, 10, 15, 20, 25, 30, 40, 50])
     fig, ax = plt.subplots(figsize=(5.4, 3.2))
     means = []
@@ -561,7 +481,6 @@ def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
     fig.tight_layout()
     _save_fig(fig, out_dir / "top_k_curve")
 
-    # Gini distribution
     ginis = [r["gini"] for r in per_example if not math.isnan(r.get("gini", float("nan")))]
     if ginis:
         fig, ax = plt.subplots(figsize=(5.0, 3.0))
@@ -575,7 +494,6 @@ def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
         fig.tight_layout()
         _save_fig(fig, out_dir / "gini_distribution")
 
-    # Persist per-example sparsity table
     out_dir.mkdir(parents=True, exist_ok=True)
     if per_example:
         fieldnames = list(per_example[0].keys())
@@ -595,18 +513,12 @@ def figure_e1_5(examples: list[ExampleMaps], out_dir: Path,
     return summary
 
 
-# ============================================================================
-# Figure 1
-# ============================================================================
-
-
 def figure_1(examples: list[ExampleMaps], out_dir: Path,
              primary_operator: str, primary_metric: str, primary_video_metric: str,
              highlight_ids: list[str] | None) -> list[str]:
     import matplotlib.pyplot as plt
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pick examples: explicit list or top-3 by sparsity (top-10% mass)
     if highlight_ids:
         chosen = [e for e in examples if e.example_id in set(highlight_ids)]
     else:
@@ -654,11 +566,6 @@ def figure_1(examples: list[ExampleMaps], out_dir: Path,
         _save_fig(fig, out_dir / f"figure_1_{ex.example_id}")
         rendered.append(ex.example_id)
     return rendered
-
-
-# ============================================================================
-# Driver
-# ============================================================================
 
 
 def _stats(values: Iterable[float]) -> dict[str, Any]:
@@ -888,19 +795,16 @@ def main() -> None:
         except Exception as e:
             logger.warning("Couldn't load noise_floor: %s", e)
 
-    # E1.1 — per-example action heatmaps
     e1_1_dir = out_dir / "e1_1_action_heatmaps"
     for i, ex in enumerate(examples[: args.max_e1_1_examples]):
         figure_e1_1(ex, e1_1_dir, metrics_list)
     logger.info("E1.1 figures -> %s", e1_1_dir)
 
-    # E1.2 — per-example video heatmaps
     e1_2_dir = out_dir / "e1_2_video_heatmaps"
     for i, ex in enumerate(examples[: args.max_e1_2_examples]):
         figure_e1_2(ex, e1_2_dir, video_metric=args.primary_video_metric)
     logger.info("E1.2 figures -> %s", e1_2_dir)
 
-    # E1.3 — phase analysis
     e1_3_dir = out_dir / "e1_3_phase_analysis"
     phase_summary = figure_e1_3(examples, e1_3_dir,
                                 operator=args.primary_operator,
@@ -908,7 +812,6 @@ def main() -> None:
     (e1_3_dir / "summary.json").write_text(json.dumps(phase_summary, indent=2))
     logger.info("E1.3 figures -> %s", e1_3_dir)
 
-    # E1.4 — task analysis
     e1_4_dir = out_dir / "e1_4_task_analysis"
     task_summary = figure_e1_4(examples, e1_4_dir,
                                operator=args.primary_operator,
@@ -917,7 +820,6 @@ def main() -> None:
     (e1_4_dir / "summary.json").write_text(json.dumps(task_summary, indent=2))
     logger.info("E1.4 figures -> %s", e1_4_dir)
 
-    # E1.5 — sparsity statistics
     e1_5_dir = out_dir / "e1_5_sparsity_stats"
     sparsity_summary = figure_e1_5(examples, e1_5_dir,
                                    operator=args.primary_operator,
@@ -926,7 +828,6 @@ def main() -> None:
     (e1_5_dir / "summary.json").write_text(json.dumps(sparsity_summary, indent=2))
     logger.info("E1.5 figures -> %s", e1_5_dir)
 
-    # Figure 1
     fig1_dir = out_dir / "figure_1"
     rendered = figure_1(examples, fig1_dir,
                         primary_operator=args.primary_operator,
@@ -935,15 +836,12 @@ def main() -> None:
                         highlight_ids=highlight_ids or None)
     logger.info("Figure 1 rendered for: %s", rendered)
 
-    # Operator-agreement matrix
     agreement_summary = operator_agreement(examples, args.primary_metric)
     (out_dir / "operator_agreement.json").write_text(json.dumps(agreement_summary, indent=2))
 
-    # Compact paper table
     write_paper_table(examples, args.primary_operator, args.primary_metric,
                       noise_floor, out_dir / "paper_table.csv")
 
-    # Combined report
     write_combined_report(out_dir, examples,
                           args.primary_operator, args.primary_metric, args.primary_video_metric,
                           phase_summary, task_summary, sparsity_summary,

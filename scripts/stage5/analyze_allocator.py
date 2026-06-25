@@ -1,55 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 5 / Analyze — Allocator quality, online cost, ablation, generalization.
+"""Stage 5 analyze: Allocator quality, latency, ablation, and generalization results.
 
-Reads one or more training-run directories produced by `train_allocator.py`
-and emits every Stage-5 paper deliverable:
-
-    E5.1 — Distillation quality:
-             * IoU @ top-k, Pearson, Spearman, recall vs Stage-1 GT.
-             * Per-example map gallery (predicted vs target side-by-side).
-
-    E5.2 — Online allocation cost:
-             * Allocator inference latency (ms / call) measured on a synthetic
-               CPU+GPU benchmark batch.
-             * Comparison vs (a) full perturbation scoring time using
-               `runs/stage1_maps/*/meta.json::elapsed_s`,
-               and (b) heuristic masks (zero overhead).
-             * Optional comparison of *retention quality*: pass
-               `--alloc_rows runs/stage5_alloc/all_rows.csv` after running
-               Stage-3 `allocation_compute.py --maps_dir <predicted_maps>`,
-               and the script will plot the predicted-map retention curve
-               next to the perturbation-derived curve.
-
-    E5.3 — Generalization: aggregates results across runs whose `config.json`
-             has different `train_groups` / `val_groups`. Produces a
-             generalization bar chart.
-
-    E5.4 — Input ablations: aggregates `vision_only / vision_lang /
-             vision_proprio / vision_lang_proprio_history` runs (those names
-             match `train_allocator.py --ablation`). Bar chart over Pearson,
-             Spearman, IoU@10, recall@10.
-
-Run with one or more `--runs <dir>`; each `<dir>` is a single training
-config's output (`config.json`, `summary.json`, `train_log.json`,
-`predicted_maps/`).
-
-Example (one run + one ablation root):
-
-    python scripts/stage5/analyze_allocator.py \\
-        --maps_dir runs/stage1_maps \\
-        --runs runs/stage5_allocator/full \\
-        --ablation_root runs/stage5_allocator_ablation \\
-        --output_dir runs/stage5_analysis
-
-If you've also run Stage-3 with `--maps_dir runs/stage5_allocator/full/predicted_maps`:
-
-    python scripts/stage5/analyze_allocator.py \\
-        --maps_dir runs/stage1_maps \\
-        --runs runs/stage5_allocator/full \\
-        --ablation_root runs/stage5_allocator_ablation \\
-        --alloc_rows runs/stage5_alloc/all_rows.csv \\
-        --stage3_alloc_rows runs/stage3_alloc/all_rows.csv \\
-        --output_dir runs/stage5_analysis
+Compares predicted maps to Stage 1 ground truth and optional Stage 3 retention curves.
 """
 
 from __future__ import annotations
@@ -75,11 +27,6 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from _common import configure_neurips_matplotlib  # noqa: E402
 from allocator_model import all_metrics, top_k_mask  # noqa: E402
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
 
 
 def _load_run(run_dir: Path) -> dict[str, Any]:
@@ -141,11 +88,6 @@ def _stats(values: Iterable[float]) -> dict[str, Any]:
             "p10": float(np.quantile(arr, 0.10)),
             "p90": float(np.quantile(arr, 0.90)),
             "std": float(arr.std())}
-
-
-# ============================================================================
-# E5.1 — distillation quality (predicted vs Stage-1 ground truth)
-# ============================================================================
 
 
 def _load_heatmap_2d(maps_dir: Path, example_id: str,
@@ -265,11 +207,6 @@ def plot_prediction_gallery(run_dir: Path, gt_maps_dir: Path, primary_op: str,
     _save_fig(fig, out_dir / "plot_prediction_gallery")
 
 
-# ============================================================================
-# E5.2 — online cost comparison
-# ============================================================================
-
-
 def perturbation_cost_seconds_per_example(maps_dir: Path) -> dict[str, float]:
     """Read per-example elapsed time recorded by Stage-1 compute."""
     out: dict[str, float] = {}
@@ -324,7 +261,6 @@ def benchmark_allocator_latency(run_dir: Path, n_iters: int = 50) -> dict[str, f
     lang = torch.randn(1, int(cfg.get("lang_dim", 64)), device=device)
     history = torch.randn(1, int(cfg.get("history_len", 4)),
                            int(cfg.get("action_dim", 8)), device=device)
-    # Warmup
     with torch.no_grad():
         for _ in range(5):
             _ = model(img, proprio, lang, history)
@@ -441,11 +377,6 @@ def plot_retention_quality_overlay(stage3_rows: list[dict[str, Any]],
     _save_fig(fig, out_dir / "plot_retention_quality_overlay")
 
 
-# ============================================================================
-# E5.3 — generalization across task groups
-# ============================================================================
-
-
 def gather_generalization(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for run in runs:
@@ -489,11 +420,6 @@ def plot_generalization(rows: list[dict[str, Any]], out_dir: Path) -> None:
     ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     _save_fig(fig, out_dir / "plot_generalization")
-
-
-# ============================================================================
-# E5.4 — input ablations
-# ============================================================================
 
 
 ABLATION_NAMES = ["vision_only", "vision_lang", "vision_proprio",
@@ -545,11 +471,6 @@ def plot_ablation(rows: list[dict[str, Any]], out_dir: Path) -> None:
     ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     _save_fig(fig, out_dir / "plot_ablation")
-
-
-# ============================================================================
-# Combined report
-# ============================================================================
 
 
 def write_combined_report(out_dir: Path,
@@ -631,11 +552,6 @@ def write_combined_report(out_dir: Path,
     (out_dir / "combined_report.md").write_text("\n".join(lines))
 
 
-# ============================================================================
-# Driver
-# ============================================================================
-
-
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                 description=__doc__)
@@ -670,7 +586,6 @@ def main() -> None:
         logger.error("Pass at least one --runs <dir> or --ablation_root <dir>.")
         sys.exit(1)
 
-    # E5.1 — quality per run
     e51_dir = out_dir / "e5_1_quality"
     e51_dir.mkdir(parents=True, exist_ok=True)
     per_run_quality: dict[str, list[dict[str, Any]]] = {}
@@ -692,7 +607,6 @@ def main() -> None:
                                     args.primary_operator, args.primary_metric, sub)
         per_run_quality[run["dir"].name] = rows
 
-    # E5.2 — cost
     e52_dir = out_dir / "e5_2_cost"
     e52_dir.mkdir(parents=True, exist_ok=True)
     primary_run = runs[0] if runs else None
@@ -703,14 +617,12 @@ def main() -> None:
                                             e52_dir,
                                             heuristic_overhead_ms=args.heuristic_overhead_ms)
         (e52_dir / "summary.json").write_text(json.dumps(cost_summary, indent=2))
-        # Optional retention-quality overlay
         stage3_rows = _load_csv_rows(Path(args.stage3_alloc_rows)) if args.stage3_alloc_rows else []
         alloc_rows = _load_csv_rows(Path(args.alloc_rows)) if args.alloc_rows else []
         plot_retention_quality_overlay(stage3_rows, alloc_rows, e52_dir)
     else:
         cost_summary = {}
 
-    # E5.3 — generalization (multi-run)
     e53_dir = out_dir / "e5_3_generalization"
     e53_dir.mkdir(parents=True, exist_ok=True)
     generalization_rows = gather_generalization(runs)
@@ -722,7 +634,6 @@ def main() -> None:
             for r in generalization_rows:
                 w.writerow(r)
 
-    # E5.4 — ablation
     e54_dir = out_dir / "e5_4_ablation"
     e54_dir.mkdir(parents=True, exist_ok=True)
     ablation_rows: list[dict[str, Any]] = []
@@ -736,7 +647,6 @@ def main() -> None:
                 for r in ablation_rows:
                     w.writerow(r)
 
-    # Combined report
     write_combined_report(out_dir, per_run_quality, generalization_rows,
                           ablation_rows, cost_summary)
     (out_dir / "combined_report.json").write_text(json.dumps({

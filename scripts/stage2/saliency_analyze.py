@@ -1,49 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 2 / Analyze — Saliency comparison study (E2.1, Figure 2, E2.3).
+"""Stage 2 analyze: Compare saliency proxies to Stage 1 action-causal maps.
 
-Loads:
-  * Stage 1 action-causal heatmaps from `--maps_dir` (the CALA-WAM signal),
-  * Stage 2 saliency proxies from `--saliency_dir`.
-
-Then emits all Stage-2 paper artifacts:
-
-    E2.1 — Per-(example, proxy) IoU at top-k%, Pearson, Spearman, recall.
-           Aggregate IoU bar chart, IoU heatmap (proxy × example).
-    E2.2 — *Stub*: action-degradation table is delegated to Stage 3 (which
-           runs the matched-budget retention sweep over every proxy and
-           the action-causal map). Stage 2 emits a smaller validation
-           sweep (one budget) only when --do_action_sweep is set.
-    E2.3 — Failure-case gallery: examples where every proxy ranks the
-           action-causal high-importance region in the *bottom* half.
-    Figure 2 — Per-row composite:
-       | Input | semantic (CLIP) | attention (DiT) | optical flow | gripper proxy | CALA-WAM |
-
-Outputs:
-
-    runs/stage2_analysis/
-        e2_1_overlap/
-            iou_table.csv
-            correlation_table.csv
-            plot_iou_per_proxy.png/.pdf
-            plot_iou_heatmap.png/.pdf
-            plot_correlation_per_proxy.png/.pdf
-            summary.json
-        e2_3_failures/
-            failure_<example_id>.png/.pdf
-        figure_2/
-            figure_2.png/.pdf            (multi-row gallery; up to --max_rows examples)
-        combined_report.md
-        combined_report.json
-        paper_table.csv
-
-Run:
-
-    python scripts/stage2/saliency_analyze.py \\
-        --maps_dir runs/stage1_maps \\
-        --saliency_dir runs/stage2_saliency \\
-        --top_k_pct 10 \\
-        --max_rows 6 \\
-        --output_dir runs/stage2_analysis
+Reports IoU, correlation, failure cases, and the Figure 2 comparison gallery.
 """
 
 from __future__ import annotations
@@ -67,11 +25,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STAGE0_DIR = SCRIPT_DIR.parent / "stage0"
 sys.path.insert(0, str(STAGE0_DIR))
 from _common import configure_neurips_matplotlib  # noqa: E402
-
-
-# ============================================================================
-# Data loading
-# ============================================================================
 
 
 @dataclass
@@ -122,11 +75,6 @@ def _load_example(saliency_dir: Path, maps_dir: Path | None,
         baseline_input_path=(saliency_dir / "baseline_input.png"),
         baseline_decoded_path=decoded_path,
     )
-
-
-# ============================================================================
-# Overlap / correlation metrics
-# ============================================================================
 
 
 def _to_2d(arr: np.ndarray) -> np.ndarray:
@@ -210,11 +158,6 @@ def _recall_top_k(action_causal: np.ndarray, proxy: np.ndarray, k_pct: float) ->
     return float(np.logical_and(a_mask, p_mask).sum() / a_count)
 
 
-# ============================================================================
-# Visualisation
-# ============================================================================
-
-
 def _save_fig(fig, base: Path) -> None:
     base.parent.mkdir(parents=True, exist_ok=True)
     for ext in (".png", ".pdf"):
@@ -261,11 +204,6 @@ def _overlay(ax, base_rgb: np.ndarray | None, sal: np.ndarray, title: str,
     if colorbar:
         cb = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
         cb.ax.tick_params(labelsize=7)
-
-
-# ============================================================================
-# E2.1 — overlap & correlation metrics
-# ============================================================================
 
 
 PROXY_DISPLAY_ORDER = [
@@ -407,11 +345,6 @@ def plot_correlation_per_proxy(rows: list[dict[str, Any]], out_dir: Path) -> Non
     _save_fig(fig, out_dir / "plot_correlation_per_proxy")
 
 
-# ============================================================================
-# E2.3 — failure-case gallery
-# ============================================================================
-
-
 def find_failure_examples(examples: list[ExampleData], k_pct: float,
                           n_max: int) -> list[ExampleData]:
     """Examples where every proxy's IoU with action-causal is < median."""
@@ -457,11 +390,6 @@ def plot_failure_example(ex: ExampleData, out_dir: Path) -> None:
     _save_fig(fig, out_dir / f"failure_{ex.example_id}")
 
 
-# ============================================================================
-# Figure 2 — main comparison gallery
-# ============================================================================
-
-
 FIG2_PROXIES = ["clip_features", "dit_attention", "optical_flow", "gripper_proxy"]
 FIG2_PROXY_LABELS = {
     "clip_features": "semantic",
@@ -486,7 +414,6 @@ def figure_2(examples: list[ExampleData], out_dir: Path, max_rows: int) -> list[
         axes[r][0].imshow(base); axes[r][0].axis("off")
         if r == 0:
             axes[r][0].set_title("input", fontsize=10)
-        # Annotate row with task group on the left
         axes[r][0].text(-0.05, 0.5, f"{ex.meta.get('task_group', '')}\n{ex.example_id[-12:]}",
                         rotation=90, va="center", ha="right",
                         transform=axes[r][0].transAxes, fontsize=7)
@@ -509,11 +436,6 @@ def figure_2(examples: list[ExampleData], out_dir: Path, max_rows: int) -> list[
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     _save_fig(fig, out_dir / "figure_2")
     return [ex.example_id for ex in rows_examples]
-
-
-# ============================================================================
-# Helpers / report
-# ============================================================================
 
 
 def _stats(values: Iterable[float]) -> dict[str, Any]:
@@ -615,11 +537,6 @@ def write_combined_report(out_dir: Path, examples: list[ExampleData],
     return summary
 
 
-# ============================================================================
-# Driver
-# ============================================================================
-
-
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description=__doc__)
     p.add_argument("--saliency_dir", required=True,
@@ -663,7 +580,6 @@ def main() -> None:
     logger.info("Loaded %d examples (%d with action-causal maps)",
                 len(examples), sum(1 for e in examples if e.action_causal is not None))
 
-    # Optional explicit example-id allow-list (file path with @prefix, or inline list).
     if args.example_ids:
         spec = args.example_ids.strip()
         if spec.startswith("@"):
@@ -680,7 +596,6 @@ def main() -> None:
             for m in sorted(missing):
                 logger.warning("  not found: %s", m)
 
-    # Drop examples without an action-causal map by default so all metrics,
     # figures, and counts are like-for-like.
     if args.require_action_causal:
         before = len(examples)
@@ -692,7 +607,6 @@ def main() -> None:
     if not examples:
         sys.exit(1)
 
-    # E2.1
     e21_dir = out_dir / "e2_1_overlap"
     rows = compute_overlap_table(examples, args.top_k_pct)
     _write_csv(rows, e21_dir / "iou_table.csv")
@@ -704,19 +618,16 @@ def main() -> None:
     (e21_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     logger.info("E2.1 -> %s", e21_dir)
 
-    # Figure 2
     fig2_dir = out_dir / "figure_2"
     fig2_ids = figure_2(examples, fig2_dir, max_rows=args.max_rows)
     logger.info("Figure 2 rendered with %d rows", len(fig2_ids))
 
-    # E2.3
     e23_dir = out_dir / "e2_3_failures"
     failures = find_failure_examples(examples, args.top_k_pct, args.max_failures)
     for ex in failures:
         plot_failure_example(ex, e23_dir)
     logger.info("E2.3 wrote %d failure cases", len(failures))
 
-    # Paper-table compact CSV: per (example, proxy) row
     paper_rows = []
     for r in rows:
         paper_rows.append({
@@ -730,7 +641,6 @@ def main() -> None:
         })
     _write_csv(paper_rows, out_dir / "paper_table.csv")
 
-    # Combined report
     full_summary = write_combined_report(out_dir, examples, rows, args.top_k_pct, fig2_ids)
     (out_dir / "combined_report.json").write_text(json.dumps({
         "k_pct": args.top_k_pct,

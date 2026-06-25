@@ -1,23 +1,6 @@
-"""Stage 5 — Allocator model + dataset for amortized importance prediction.
+"""Stage 5 model: Dataset, network, and metrics for the CALA-WAM allocator.
 
-Self-contained (no DreamZero imports): the model takes a single observation
-(image + proprioception + instruction + action history) and predicts a 2-D
-importance map at the same spatial shape as the Stage-1 action-causal heatmap.
-
-The training target is the Stage-1 perturbation-derived heatmap (averaged over
-the T latent axis to a 2-D map). Training drives the allocator to mimic that
-expensive perturbation signal from cheap, real-time inputs.
-
-This module exposes:
-
-    Allocator              — small CNN+MLP, configurable input ablations.
-    PerturbMapDataset      — yields (image, proprio, lang_emb, history,
-                              target_heatmap, meta) per example.
-    HashLanguageEmbedder   — tiny dep-free instruction embedder.
-    save_predictions_npz   — dump predicted maps in Stage-1's `heatmaps.npz`
-                              layout so downstream stages (3/4) can re-use them.
-
-Importable from `train_allocator.py` and `analyze_allocator.py`.
+Shared by train_allocator.py and analyze_allocator.py.
 """
 
 from __future__ import annotations
@@ -38,11 +21,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 logger = logging.getLogger("stage5.allocator_model")
-
-
-# ============================================================================
-# Lightweight language embedder (no extra deps)
-# ============================================================================
 
 
 class HashLanguageEmbedder:
@@ -86,11 +64,6 @@ class HashLanguageEmbedder:
         v = np.mean(np.stack(vecs, axis=0), axis=0)
         self._cache[instruction] = v
         return v
-
-
-# ============================================================================
-# Dataset
-# ============================================================================
 
 
 @dataclass
@@ -150,7 +123,6 @@ def _build_history(manifest_by_episode: dict[int, list[dict[str, Any]]],
         prev_chunk = _gt_chunk(eps_sorted[prev_idx])
         if prev_chunk.size == 0:
             continue
-        # Use the *first* action of the previous chunk as the "executed" action.
         a = prev_chunk[0]
         if a.size >= action_dim:
             out[k] = a[:action_dim]
@@ -219,7 +191,6 @@ class PerturbMapDataset(Dataset):
             ep = int(e.get("episode_index", -1))
             self._manifest_by_episode.setdefault(ep, []).append(e)
 
-        # Discover usable examples — those that have a heatmap on disk.
         ids = []
         for sub in sorted(self.maps_dir.iterdir()) if self.maps_dir.exists() else []:
             if sub.is_dir() and (sub / "heatmaps.npz").exists():
@@ -231,7 +202,6 @@ class PerturbMapDataset(Dataset):
             tg_set = set(task_groups)
             ids = [i for i in ids if (self._manifest_by_id.get(i) or {}).get("task_group") in tg_set]
 
-        # Build specs
         self._specs: list[ExampleSpec] = []
         target_shapes: set[tuple[int, int]] = set()
         for ex_id in ids:
@@ -266,7 +236,6 @@ class PerturbMapDataset(Dataset):
             max(target_shapes, key=lambda s: list(target_shapes).count(s)) if target_shapes else (0, 0)
         )
 
-        # Cache proprio_dim + lang_dim
         self.proprio_dim = int(self._specs[0].proprio.shape[0]) if self._specs else 0
         self.lang_dim = int(lang_dim)
 
@@ -306,7 +275,6 @@ class PerturbMapDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         spec = self._specs[idx]
-        # Load image at frame_index (best-effort: use OpenCV)
         try:
             import cv2
             cap = cv2.VideoCapture(str(spec.image_path))
@@ -341,11 +309,6 @@ class PerturbMapDataset(Dataset):
             "role": spec.role, "episode_index": spec.episode_index,
             "frame_index": spec.frame_index,
         }
-
-
-# ============================================================================
-# Allocator network
-# ============================================================================
 
 
 class Allocator(nn.Module):
@@ -434,11 +397,6 @@ class Allocator(nn.Module):
         return out.squeeze(1)                            # (B, target_h, target_w)
 
 
-# ============================================================================
-# Saving predictions in Stage-1 layout
-# ============================================================================
-
-
 def save_predictions_npz(out_dir: Path, example_id: str,
                          predicted_2d: np.ndarray,
                          primary_op: str, primary_metric: str,
@@ -457,11 +415,6 @@ def save_predictions_npz(out_dir: Path, example_id: str,
         **{f"{primary_op}__{primary_metric}": arr,
            f"{primary_op}__valid": valid},
     )
-
-
-# ============================================================================
-# Metrics over predicted vs target maps
-# ============================================================================
 
 
 def _flatten_pos(arr: np.ndarray) -> np.ndarray:

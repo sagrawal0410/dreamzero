@@ -1,6 +1,6 @@
 #!/bin/bash
-# Usage:
-#   bash scripts/train/droid_training_wan22_amd_trust_region.sh
+# AMD + trust-region training: spatial token weights relax distillation in moving regions.
+# Usage: bash scripts/train/droid_training_wan22_amd_trust_region.sh
 
 export HYDRA_FULL_ERROR=1
 

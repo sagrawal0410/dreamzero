@@ -1,56 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 1 / Compute — Per-block causal-importance maps for DreamZero-DROID.
+"""Stage 1 compute: Block-wise perturbation sweep for action-causal heatmaps.
 
-Implements the **core perturbation pass** that Stage-1 analysis (E1.1 – E1.5)
-consumes. For each manifest example we sweep every (T_lat, H_lat, W_lat)
-block of the action head's VAE-encoded conditioning latent `head.ys` and,
-for each Stage-1 perturbation operator, measure how much the predicted
-action chunk and the generated future-video latents change. Output is a set
-of per-example heatmap arrays + a baseline-input image, written into a
-deterministic directory layout that the analysis script reads.
-
-For a given example with latent grid `(T_lat, H_lat, W_lat)`, an operator
-`M`, and block index `i = (t, h, w)` of size `(bt, bh, bw)`:
-
-    s_i^M = ||a(z) - a(M_i z)||             (action sensitivity)
-    v_i^M = ||v(z) - v(M_i z)||             (future-latent sensitivity)
-    g_i^M = | gripper(a(z)) - gripper(a(M_i z)) |
-    f_i^M = ||a_first(z) - a_first(M_i z)|| (near-horizon sensitivity)
-
-We also record `perturbation_norm_relative_i^M = ||z_i' - z_i|| / ||z_i||`
-so the analysis script can produce both raw and norm-normalised heatmaps.
-
-This script is **GPU heavy** — it does `num_blocks * num_operators` forward
-passes per example. Use `--block_size N` (default 1) for a coarser grid,
-`--num_examples K` and `--max_blocks B` to bound runtime, and reduce
-`--operators` to fewer choices for fast iteration.
-
-Example (full pass, ~1.5 h for 8 examples on H100):
-
-    python scripts/stage1/causal_maps_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 8 \\
-        --operators local_mean,blur_k3,prev_frame_cache_l1,zero_mask \\
-        --alpha 1.0 \\
-        --block_size 1 \\
-        --output_dir runs/stage1_maps
-
-Smoke (fast) example (~6 min):
-
-    python scripts/stage1/causal_maps_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 2 --operators local_mean --block_size 2 \\
-        --output_dir runs/stage1_maps_smoke
-
-Per-example output layout:
-
-    runs/stage1_maps/<example_id>/
-        meta.json                       — example metadata + latent shape
-        baseline_input.png              — first camera view at frame_index
-        baseline_decoded.png            — VAE-decoded baseline ys (sanity)
-        heatmaps.npz                    — operator × metric × (T,H,W) arrays
+Measures action and video sensitivity per latent block; writes heatmaps.npz per example.
 """
 
 from __future__ import annotations
@@ -95,11 +46,6 @@ from _common import (  # noqa: E402
 import perturbation_suite as ps  # noqa: E402  (for capture_baseline / run_perturbed / op_*)
 
 
-# ============================================================================
-# Operator catalogue used by Stage 1 (subset of Stage-0 perturbation_suite)
-# ============================================================================
-
-
 STAGE1_OPERATORS: dict[str, dict[str, Any]] = {
     "local_mean":          {"fn": ps.op_local_mean,         "category": "in_distribution"},
     "frame_mean":          {"fn": ps.op_frame_mean,         "category": "in_distribution"},
@@ -124,11 +70,6 @@ STAGE1_OPERATORS: dict[str, dict[str, Any]] = {
 }
 
 
-# ============================================================================
-# Block iterator
-# ============================================================================
-
-
 def _iter_blocks(latent_shape: tuple[int, int, int],
                  block_size: tuple[int, int, int]) -> Iterable[tuple[tuple[slice, slice, slice], tuple[int, int, int]]]:
     """Yield (region_slices, block_index) covering the latent grid.
@@ -150,11 +91,6 @@ def _iter_blocks(latent_shape: tuple[int, int, int],
                 h0 = ih * bh; h1 = min(H, h0 + bh)
                 w0 = iw * bw; w1 = min(W, w0 + bw)
                 yield (slice(t0, t1), slice(h0, h1), slice(w0, w1)), (it, ih, iw)
-
-
-# ============================================================================
-# Metric extraction
-# ============================================================================
 
 
 def _action_metrics(base_chunk: np.ndarray, pert_chunk: np.ndarray) -> dict[str, float]:
@@ -192,11 +128,6 @@ def _latent_perturbation_norm(ys_base: torch.Tensor, ys_pert: torch.Tensor,
     base_norm = float(block_orig.norm().clamp_min(1e-8).item())
     diff_norm = float((block_pert - block_orig).norm().item())
     return diff_norm / base_norm
-
-
-# ============================================================================
-# Visualisation helpers
-# ============================================================================
 
 
 def _save_input_image(entry: dict[str, Any], out_path: Path,
@@ -245,11 +176,6 @@ def _save_decoded_baseline(head: Any, ys_base: torch.Tensor, out_path: Path) -> 
         return False
 
 
-# ============================================================================
-# Per-example causal map
-# ============================================================================
-
-
 def compute_example(policy: GrootSimPolicy,
                     entry: dict[str, Any],
                     operators: list[str],
@@ -262,13 +188,11 @@ def compute_example(policy: GrootSimPolicy,
     out_dir.mkdir(parents=True, exist_ok=True)
     head = policy.trained_model.action_head
 
-    # Baseline (capture ys, action, video_pred)
     obs = build_obs(entry)
     baseline = ps.capture_baseline(policy, obs, seed)
     T, H, W = int(baseline.ys.shape[2]), int(baseline.ys.shape[3]), int(baseline.ys.shape[4])
     logger.info("[%s] latent shape T×H×W = %d × %d × %d", entry["example_id"], T, H, W)
 
-    # Auxiliary inputs lazily computed when needed
     aux_cache: dict[str, Any] = {}
 
     def _aux(name: str) -> Any:
@@ -282,7 +206,6 @@ def compute_example(policy: GrootSimPolicy,
             return aux_cache[name]
         return None
 
-    # Allocate heatmaps per (operator, metric)
     bt, bh, bw = block_size
     nT = math.ceil(T / bt); nH = math.ceil(H / bh); nW = math.ceil(W / bw)
     metrics_keys = ("action_l2", "action_first", "action_near", "action_far",
@@ -297,13 +220,11 @@ def compute_example(policy: GrootSimPolicy,
         op_name: np.zeros((nT, nH, nW), dtype=np.int8) for op_name in operators
     }
 
-    # Save sanity images
     _save_input_image(entry, out_dir / "baseline_input.png")
     _save_decoded_baseline(head, baseline.ys, out_dir / "baseline_decoded.png")
 
     rng = np.random.default_rng(seed)
 
-    # Filter operators that need missing inputs (auto-skip)
     feasible_operators: list[str] = []
     for op_name in operators:
         spec = STAGE1_OPERATORS.get(op_name)
@@ -376,7 +297,6 @@ def compute_example(policy: GrootSimPolicy,
 
     total = time.perf_counter() - t_start
 
-    # Save artifacts
     np_payload = {}
     for op_name in feasible_operators:
         for m in metrics_keys:
@@ -384,7 +304,6 @@ def compute_example(policy: GrootSimPolicy,
         np_payload[f"{op_name}__valid"] = valid_blocks[op_name]
     np.savez_compressed(out_dir / "heatmaps.npz", **np_payload)
 
-    # Baseline action chunk + video summary (helps later analysis without re-running)
     np.save(out_dir / "baseline_action_chunk.npy", baseline.action_chunk)
 
     meta = {
@@ -411,16 +330,10 @@ def compute_example(policy: GrootSimPolicy,
     return meta
 
 
-# ============================================================================
-# Driver
-# ============================================================================
-
-
 def _select_examples(manifest: list[dict[str, Any]], num: int,
                      phase_balanced: bool) -> list[dict[str, Any]]:
     if not phase_balanced:
         return manifest[:num]
-    # Stratify by (task_group, role) so phase-analysis later has enough data.
     by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for entry in manifest:
         by_key.setdefault((entry.get("task_group", ""), entry.get("role", "")), []).append(entry)
@@ -487,7 +400,6 @@ def main() -> None:
     )
     logger.info("Model loaded.")
 
-    # Pre-pass: capture baselines to compute dataset_mean_lat (only if needed).
     needs_dataset_mean = any(
         "dataset_mean_lat" in (STAGE1_OPERATORS[o].get("needs", []) or []) for o in operators
     )
@@ -505,7 +417,6 @@ def main() -> None:
             dataset_mean_lat = ps.compute_dataset_mean(baselines)
             logger.info("dataset_mean_lat shape=%s", list(dataset_mean_lat.shape) if dataset_mean_lat is not None else None)
 
-    # Per-example sweep
     all_meta: list[dict[str, Any]] = []
     for i, entry in enumerate(chosen):
         ex_dir = out_dir / entry["example_id"]
@@ -528,7 +439,6 @@ def main() -> None:
             logger.error("compute_example failed for %s: %s", entry["example_id"], e, exc_info=True)
             continue
 
-    # Run-level manifest (for the analysis script)
     (out_dir / "compute_run.json").write_text(json.dumps({
         "checkpoint": args.checkpoint,
         "task_suite": args.task_suite,

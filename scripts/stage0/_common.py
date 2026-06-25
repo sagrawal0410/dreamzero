@@ -1,9 +1,4 @@
-"""Shared helpers for Stage 0 scripts (E0.0 / E0.1 / E0.2 / E0.3).
-
-Kept intentionally tiny so each Stage 0 script can stay self-contained while
-sharing the small surface that touches the model: distributed init, the
-DROID observation schema, the per-example observation builder, and the
-causal-state reset between examples.
+"""Stage 0 shared helpers: observation building and distributed init for eval scripts.
 """
 
 from __future__ import annotations
@@ -13,9 +8,6 @@ from typing import Any
 
 import numpy as np
 
-# ----------------------------------------------------------------------------
-# Modality keys for OXE_DROID — must match training config
-# ----------------------------------------------------------------------------
 
 VIDEO_KEYS: tuple[str, ...] = (
     "video.exterior_image_1_left",
@@ -42,7 +34,6 @@ def init_dist_single_process() -> None:
 
 class FrameReadError(RuntimeError):
     """Raised when an MP4 frame cannot be decoded (truncated file, missing moov, etc.)."""
-
 
 def read_frame(mp4_path: str, frame_index: int) -> np.ndarray:
     import cv2

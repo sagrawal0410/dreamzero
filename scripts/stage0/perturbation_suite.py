@@ -1,56 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0 / E0.6 — Perturbation Operator Sanity Suite for DreamZero-DROID.
+"""Stage 0: Compare perturbation operators on conditioning latents.
 
-Decides which perturbation operator(s) to use for the Stage-1 causal-importance
-maps. Implements a deliberately redundant suite spanning:
-
-    A. Controls           — identity, copy-and-reinsert, tiny epsilon noise.
-    B. Destructive        — zero mask, sign flip, magnitude scale.
-    C. In-distribution    — dataset / frame / local-neighborhood mean.
-    D. Noise              — matched-std Gaussian, matched-norm Gaussian,
-                             channel dropout.
-    E. Compression-like   — average pooling, spatial blur (low-pass).
-    F. Temporal / cache   — previous-frame cache (lag 1, 2, 4).
-    G. Spatial specificity — nearby-region swap.
-
-Each operator is applied to a region of the action head's VAE-encoded
-conditioning latents (`head.ys`) — channels 4: only, since channels 0:4 are a
-binary frame-validity mask. Re-injection works by monkey-patching
-`head.encode_image` to return the (cached_clip_feas, perturbed_ys,
-cached_new_image) tuple while everything else in the forward pass stays bit-
-identical to the baseline. Same `torch.manual_seed` for baseline and perturbed
-(paired-seed protocol) so deltas reflect the perturbation, not sampling noise.
-
-Per (example, operator, strength, region) we record:
-
-    delta_action_l2 / cosine / first / near / far / gripper
-    delta_video_pred_l2
-    latent_perturbation_norm + relative
-    latent_zscore (OOD diagnostic)
-    nan_rate / valid
-    normalized_effect = delta_action_l2 / (sigma_seed + eps)   if --noise_floor
-
-Outputs (under <output_dir>):
-
-    per_run.csv                       — long-form table, one row per config
-    summary_per_operator.json         — aggregated stats and ranking
-    operator_ranking.csv              — paper-ready ranking table
-    plots/
-        plot_strength_sweep__<op>.png/pdf      — Δa vs strength per operator
-        plot_operator_heatmap.png/pdf          — operator × region Δa heatmap
-        plot_operator_ranking.png/pdf          — bar of validity / locality / sensitivity
-        plot_validity.png/pdf                  — NaN / failure rate per operator
-    decoded_grid/<example>/<op>__<strength>__<region>.png  — visual sanity
-    combined_report.md                — paper-appendix-ready summary + Stage-1 recommendation
-
-Example:
-
-    python scripts/stage0/perturbation_suite.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 4 \\
-        --noise_floor runs/stage0_stability/noise_floor.json \\
-        --output_dir runs/stage0_perturb
+Ranks operators by action sensitivity and validity before Stage 1 causal map sweeps.
 """
 
 from __future__ import annotations
@@ -97,11 +48,6 @@ from _common import (  # noqa: E402
     read_frame,
     reset_causal_state,
 )
-
-
-# ============================================================================
-# Per-example baseline capture & perturbed re-run
-# ============================================================================
 
 
 @dataclass
@@ -206,11 +152,6 @@ def run_perturbed(policy: GrootSimPolicy,
     return chunk, actions, video_pred, elapsed
 
 
-# ============================================================================
-# Region masks (in latent T × H × W)
-# ============================================================================
-
-
 def _region_slices(ys_shape: tuple[int, ...], name: str,
                    rng: np.random.Generator) -> tuple[slice, slice, slice]:
     """Return (slice_t, slice_h, slice_w) for the named region in latent space."""
@@ -245,15 +186,10 @@ REGION_MEANING = {
 }
 
 
-# ============================================================================
-# Operator implementations
-# ============================================================================
 #
-# Every operator receives the FULL ys tensor and the region slices, then
 # returns a NEW ys tensor with the region replaced. Channels 0:z_channel_start
 # (the validity mask) are NEVER perturbed — they are copied from the original
 # tensor. This keeps the masked-conditioning semantics intact.
-# ----------------------------------------------------------------------------
 
 
 def _split_channels(ys: torch.Tensor, ch0: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -337,7 +273,6 @@ def op_dataset_mean(ys, region, ch0, strength=1.0, dataset_mean_lat=None, **_kw)
 def op_frame_mean(ys, region, ch0, strength=1.0, **_kw):
     _, lat_ch = _split_channels(ys, ch0)
     block = lat_ch[:, :, region[0], region[1], region[2]]
-    # Mean over T, H, W per batch, per channel
     target = lat_ch.mean(dim=(2, 3, 4), keepdim=True).expand_as(block)
     return _apply_to_block(ys, region, target, ch0, strength=strength)
 
@@ -346,7 +281,6 @@ def op_local_mean(ys, region, ch0, strength=1.0, **_kw):
     """Replace block with mean of latents *outside* the region (whole-image local mean)."""
     _, lat_ch = _split_channels(ys, ch0)
     block = lat_ch[:, :, region[0], region[1], region[2]]
-    # Build mask 1 outside, 0 inside the region; compute weighted mean
     full = lat_ch.float()
     outside_mask = torch.ones_like(full)
     outside_mask[:, :, region[0], region[1], region[2]] = 0.0
@@ -404,7 +338,6 @@ def op_avg_pool(ys, region, ch0, strength=1.0, factor=2, **_kw):
     f = int(factor)
     fh = max(1, min(f, H))
     fw = max(1, min(f, W))
-    # Average over fh × fw windows then upsample with nearest to original size
     pooled = F.avg_pool3d(block.float(), kernel_size=(1, fh, fw), stride=(1, fh, fw))
     pooled_up = F.interpolate(pooled, size=(T, H, W), mode="nearest")
     return _apply_to_block(ys, region, pooled_up.to(block.dtype), ch0, strength=strength)
@@ -446,7 +379,6 @@ def op_nearby_swap(ys, region, ch0, strength=1.0, rng=None, **_kw):
     bw = sl_w.stop - sl_w.start
     H, W = lat_ch.shape[-2], lat_ch.shape[-1]
     rng = rng or np.random.default_rng(0)
-    # Look for a non-overlapping nearby block within ±2 block sizes
     for _ in range(20):
         h0 = int(rng.integers(max(0, sl_h.start - 2 * bh), min(H - bh, sl_h.stop + 2 * bh) + 1))
         w0 = int(rng.integers(max(0, sl_w.start - 2 * bw), min(W - bw, sl_w.stop + 2 * bw) + 1))
@@ -456,11 +388,6 @@ def op_nearby_swap(ys, region, ch0, strength=1.0, rng=None, **_kw):
     if target.shape != lat_ch[:, :, region[0], region[1], region[2]].shape:
         return op_identity(ys, region, ch0)
     return _apply_to_block(ys, region, target, ch0, strength=strength)
-
-
-# ============================================================================
-# Operator registry (name, fn, strengths, category)
-# ============================================================================
 
 
 @dataclass
@@ -497,11 +424,6 @@ OPERATORS: list[OperatorSpec] = [
     OperatorSpec("prev_frame_cache_l2", op_prev_frame_cache, [1.0],           "temporal", needs=["prev_ys_l2"]),
     OperatorSpec("prev_frame_cache_l4", op_prev_frame_cache, [1.0],           "temporal", needs=["prev_ys_l4"]),
 ]
-
-
-# ============================================================================
-# Metrics
-# ============================================================================
 
 
 def _safe_l2(a: np.ndarray, b: np.ndarray) -> float:
@@ -553,7 +475,6 @@ def _latent_metrics(ys_base: torch.Tensor, ys_pert: torch.Tensor,
     block_pert = ys_pert[:, ch0:, sl_t, sl_h, sl_w].float()
     base_norm = float(block_orig.norm().clamp_min(1e-8).item())
     pert_norm = float(block_diff.norm().item())
-    # Per-channel z-score of perturbed block
     full_mean = ys_base[:, ch0:].float().mean(dim=(2, 3, 4), keepdim=True)
     full_std = ys_base[:, ch0:].float().std(dim=(2, 3, 4), keepdim=True).clamp_min(1e-8)
     z = ((block_pert - full_mean) / full_std).abs().mean()
@@ -562,11 +483,6 @@ def _latent_metrics(ys_base: torch.Tensor, ys_pert: torch.Tensor,
         "perturbation_norm_relative": pert_norm / base_norm,
         "block_zscore_mean": float(z.item()),
     }
-
-
-# ============================================================================
-# Decoded visual sanity
-# ============================================================================
 
 
 def _try_decode_ys_first_frame(head: Any, ys_full: torch.Tensor) -> np.ndarray | None:
@@ -578,7 +494,6 @@ def _try_decode_ys_first_frame(head: Any, ys_full: torch.Tensor) -> np.ndarray |
     """
     try:
         z = ys_full[:, 4:, :, :, :].float()
-        # The VAE.decode expects (B, C_lat, T_lat, H_lat, W_lat).
         with torch.inference_mode():
             params = next(head.vae.parameters(), None)
             if params is None:
@@ -590,7 +505,6 @@ def _try_decode_ys_first_frame(head: Any, ys_full: torch.Tensor) -> np.ndarray |
                 tile_size=(getattr(head, "tile_size_height", 34), getattr(head, "tile_size_width", 34)),
                 tile_stride=(getattr(head, "tile_stride_height", 18), getattr(head, "tile_stride_width", 16)),
             )
-        # frames: (B, C, T, H, W) in [-1, 1]
         f0 = frames[0, :, 0]                     # (C, H, W)
         f0 = ((f0.float() + 1.0) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
         return np.transpose(f0, (1, 2, 0))       # H, W, C
@@ -620,11 +534,6 @@ def _save_decoded_grid(head: Any, ys_base: torch.Tensor, ys_pert: torch.Tensor,
     except Exception as e:
         logger.warning("Decoded grid save failed: %s", e)
         return False
-
-
-# ============================================================================
-# Aux. inputs computation: dataset mean and prev-frame ys
-# ============================================================================
 
 
 def compute_dataset_mean(baselines: list[BaselineCache]) -> torch.Tensor | None:
@@ -663,11 +572,6 @@ def fetch_prev_frame_ys(policy: GrootSimPolicy, manifest_entry: dict[str, Any],
     return cache.get("ys")
 
 
-# ============================================================================
-# Driver: per-example sweep
-# ============================================================================
-
-
 def sweep_example(policy: GrootSimPolicy,
                   baseline: BaselineCache,
                   manifest_entry: dict[str, Any],
@@ -681,7 +585,6 @@ def sweep_example(policy: GrootSimPolicy,
     rng = np.random.default_rng(seed_global)
     rows: list[dict[str, Any]] = []
 
-    # Lazy fetch of previous-frame ys
     prev_ys_cache: dict[str, torch.Tensor | None] = {}
 
     def _get_prev_ys(lag: int) -> torch.Tensor | None:
@@ -776,11 +679,6 @@ def sweep_example(policy: GrootSimPolicy,
                             am["delta_l2"], am["delta_first"], lm["perturbation_norm_relative"],
                             row["valid"])
     return rows
-
-
-# ============================================================================
-# Aggregation, ranking, plots, report
-# ============================================================================
 
 
 def aggregate_per_operator(rows: list[dict[str, Any]],
@@ -1068,11 +966,6 @@ def write_combined_report(out_dir: Path, ranking: list[dict[str, Any]],
     for r, m in REGION_MEANING.items():
         lines.append(f"  - `{r}` — {m}")
     (out_dir / "combined_report.md").write_text("\n".join(lines))
-
-
-# ============================================================================
-# Helpers / driver
-# ============================================================================
 
 
 def _write_csv(rows: list[dict[str, Any]], out: Path) -> None:

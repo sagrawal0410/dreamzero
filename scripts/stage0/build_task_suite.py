@@ -1,44 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0 / E0.0 — Dataset and Task-Suite Setup for DreamZero-DROID.
+"""Stage 0: Build the DROID evaluation task suite.
 
-Builds a small but representative evaluation suite that later stages reuse.
-Reads a LeRobot-format DROID dataset, classifies each episode into task
-groups (A: easy / B: contact-sensitive / C: distractor / D: global-context)
-based on the language instruction, samples K episodes per group and T
-stratified timesteps per episode, and writes a single `manifest.json`
-that downstream stages consume.
-
-Example:
-
-    python scripts/stage0/build_task_suite.py \
-        --dataset_root ./data/droid_lerobot \
-        --task_groups scripts/stage0/configs/task_groups.yaml \
-        --num_episodes_per_group 8 \
-        --num_timesteps_per_episode 5 \
-        --output_dir runs/stage0_suite
-
-Outputs (under --output_dir):
-
-    manifest.json            : ordered list of evaluation examples
-    manifest_by_group.json   : same examples grouped by task group
-    summary.json             : counts, group sizes, instruction histograms
-    preview/<example_id>.png : one preview frame per example (sanity check)
-
-Each manifest entry contains everything the E0.1 baseline script needs to
-re-load the timestep without rescanning the dataset:
-
-    example_id, task_group, task_name, instruction,
-    episode_index, episode_path, episode_length, frame_index,
-    role (initial/approach/pre_contact/contact/post_contact),
-    video_paths   : {camera_key: absolute_mp4_path},
-    state_columns : list of parquet columns used as proprio state,
-    action_columns: list of parquet columns used as action,
-    state_at_t    : flat numpy state vector at frame_index,
-    gt_action_chunk: (action_horizon, A) ground-truth action chunk if available,
-    seed          : suite-build seed (for reproducibility)
-
-This script does NOT load the model and does NOT call any GPU ops, so it
-can be run on a small CPU box before kicking off baseline eval.
+Samples episodes and timesteps per task group and writes manifest.json for downstream stages.
 """
 
 from __future__ import annotations
@@ -62,10 +25,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("stage0.build_task_suite")
 
 
-# ----------------------------------------------------------------------------
-# Defaults that match the DROID LeRobot layout used in this repo
-# ----------------------------------------------------------------------------
-
 DEFAULT_VIDEO_KEYS = (
     "video.exterior_image_1_left",
     "video.exterior_image_2_left",
@@ -74,11 +33,6 @@ DEFAULT_VIDEO_KEYS = (
 DEFAULT_STATE_COLUMNS = ("observation.state",)
 DEFAULT_ACTION_COLUMNS = ("action",)
 DEFAULT_ACTION_HORIZON = 24
-
-
-# ----------------------------------------------------------------------------
-# Dataset discovery
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -276,11 +230,6 @@ def _discover_episodes(dataset_root: Path, video_keys: tuple[str, ...],
     return episodes
 
 
-# ----------------------------------------------------------------------------
-# Task-group classification
-# ----------------------------------------------------------------------------
-
-
 def _classify_episode(instruction: str, groups: dict[str, dict[str, Any]]) -> str | None:
     text = instruction.lower()
     for gname, gcfg in groups.items():
@@ -303,11 +252,6 @@ def _is_lfs_pointer_file(path: Path, *, sniff: int = 200) -> bool:
     except Exception:
         return False
     return head.startswith(b"version https://git-lfs.github.com/spec/")
-
-
-# ----------------------------------------------------------------------------
-# Timestep sampling and ground-truth extraction
-# ----------------------------------------------------------------------------
 
 
 def _stratified_indices(length: int, fractions: list[float]) -> list[int]:
@@ -420,11 +364,6 @@ def _read_state_action(parquet_path: Path,
     return out
 
 
-# ----------------------------------------------------------------------------
-# Optional preview frames (sanity)
-# ----------------------------------------------------------------------------
-
-
 def _save_preview(video_paths: dict[str, str], frame_index: int, out_path: Path) -> None:
     try:
         import cv2  # local import; preview is optional
@@ -448,11 +387,6 @@ def _save_preview(video_paths: dict[str, str], frame_index: int, out_path: Path)
     combined = np.concatenate(panels, axis=1)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_path), combined)
-
-
-# ----------------------------------------------------------------------------
-# Driver
-# ----------------------------------------------------------------------------
 
 
 def build_suite(args: argparse.Namespace) -> None:
@@ -539,19 +473,15 @@ def build_suite(args: argparse.Namespace) -> None:
         logger.info("--dry_run: not writing manifest.")
         return
 
-    # ------------------------------------------------------------------
     # Build a one-shot videos/ index. We do this AFTER classification
     # (which doesn't need videos) so a misconfigured task_groups.yaml
     # short-circuits via --dry_run before paying for the rglob.
-    # ------------------------------------------------------------------
     logger.info("Building video index (one rglob over videos/) ...")
     video_index = _build_video_index(dataset_root, DEFAULT_VIDEO_KEYS)
     logger.info("  indexed %d (camera, episode) pairs covering %d unique episodes",
                 len(video_index), len({e for _, e in video_index.keys()}))
 
-    # ------------------------------------------------------------------
     # Sample manifest: Group -> Task -> Episode -> Timestep
-    # ------------------------------------------------------------------
     chosen_groups = list(groups.keys())
     if include_unmatched:
         chosen_groups.append("unmatched")

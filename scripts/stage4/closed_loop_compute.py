@@ -1,56 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 4 / Compute — Closed-loop trajectory replay for CALA-WAM (E4.1 – E4.4).
+"""Stage 4 compute: Closed-loop trajectory replay with latent retention.
 
-Implements the **honest closed-loop proxy** for Stage 4. For every episode in
-the manifest we sweep every (timestep × method × budget × variant) combination
-and measure how much CALA-WAM (and every baseline) deviates from the
-ground-truth action chunk at that step.
-
-Why offline replay (vs full sim rollout)?
-
-  * The ground truth is the recorded DROID demonstration action chunk.
-  * Real closed-loop sim eval requires the `sim_evals` package + Isaac Lab,
-    which is gated and slow. `scripts/stage4/cala_wam_policy.py` ships a
-    minimal websocket-server adapter for users that have it; this script
-    provides the deterministic, reproducible signal for the paper tables.
-
-For each row we record:
-
-    episode_index, frame_index, role, task_group, instruction,
-    method, variant, budget_pct, fraction_retained_actual,
-    forward_elapsed_s, approx_latency_ratio,
-    action_l2, action_first, action_near, action_far,
-    action_gripper, action_cosine,
-    action_l2_vs_gt              # action error vs the demonstration GT
-    gripper_event                # 1 if a gripper-state transition happens at this step
-    valid
-
-Trajectories are reconstructed by grouping manifest rows by `episode_index`
-and ordering within an episode by `frame_index`. Stage-1 maps are looked up
-per (episode_index, frame_index) using the example_id; if a map is missing
-for a step we fall back to a same-episode neighbour or to a cheap proxy.
-
-Example:
-
-    python scripts/stage4/closed_loop_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --maps_dir runs/stage1_maps \\
-        --saliency_dir runs/stage2_saliency \\
-        --num_episodes 6 \\
-        --budgets 100,50,25 \\
-        --methods action_causal,cala_wam_hybrid,uniform,attention,gripper \\
-        --variants A_hard_retention \\
-        --output_dir runs/stage4_closed_loop
-
-Smoke (~10 min):
-
-    python scripts/stage4/closed_loop_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --maps_dir runs/stage1_maps \\
-        --num_episodes 2 --budgets 50 --methods action_causal,uniform \\
-        --output_dir runs/stage4_smoke
+Replays demonstration trajectories and measures action error vs GT under each retention method.
 """
 
 from __future__ import annotations
@@ -98,11 +49,6 @@ from allocation_compute import (  # noqa: E402
 )
 
 
-# ============================================================================
-# Manifest -> trajectories
-# ============================================================================
-
-
 def group_into_trajectories(manifest: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
     """Return {episode_index: [entry, ...]} sorted by frame_index."""
     by_ep: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -123,7 +69,6 @@ def _select_episodes(by_ep: dict[int, list[dict[str, Any]]],
         return list(by_ep.keys())[:num]
     by_group: dict[str, list[int]] = defaultdict(list)
     for ep, entries in by_ep.items():
-        # The episode's task group equals its first entry's task_group.
         g = (entries[0] or {}).get("task_group", "unknown")
         by_group[g].append(ep)
     keys = sorted(by_group.keys())
@@ -136,11 +81,6 @@ def _select_episodes(by_ep: dict[int, list[dict[str, Any]]],
             if len(chosen) >= num:
                 break
     return chosen[:num]
-
-
-# ============================================================================
-# Map lookup helpers
-# ============================================================================
 
 
 def _load_stage1_arrays(maps_dir: Path | None, example_id: str) -> dict[str, np.ndarray] | None:
@@ -176,7 +116,6 @@ def _resize_3d_map(arr: np.ndarray, target_shape: tuple[int, int, int]) -> np.nd
         return np.zeros(target_shape, dtype=np.float32)
     if a.shape == (Tt, Ht, Wt):
         return a
-    # Handle T mismatch by averaging if too many time slices, broadcasting if too few.
     if a.shape[0] != Tt:
         a = np.nanmean(a, axis=0, keepdims=True)
         a = np.broadcast_to(a, (Tt, *a.shape[1:])).copy()
@@ -184,11 +123,6 @@ def _resize_3d_map(arr: np.ndarray, target_shape: tuple[int, int, int]) -> np.nd
         cv2.resize(a[t], (Wt, Ht), interpolation=cv2.INTER_LINEAR) for t in range(Tt)
     ], axis=0)
     return out
-
-
-# ============================================================================
-# Metrics
-# ============================================================================
 
 
 def _action_metrics(base_chunk: np.ndarray, pert_chunk: np.ndarray,
@@ -229,7 +163,6 @@ def _gripper_event(gt_chunk: np.ndarray | None) -> int:
     g = np.asarray(gt_chunk[:, -1], dtype=np.float64)
     if g.size < 2:
         return 0
-    # Treat positive vs non-positive as open/closed.
     s = (g > 0.5).astype(np.int8) if (g.max() > 1.0 or g.min() < -0.05) else (g > 0).astype(np.int8)
     return int(np.any(np.abs(np.diff(s)) >= 1))
 
@@ -242,11 +175,6 @@ def _retention_fraction(importance: np.ndarray, budget_pct: float) -> float:
     n = min(n, flat.size)
     th = np.partition(flat, -n)[-n]
     return float((flat >= th).mean())
-
-
-# ============================================================================
-# Per-trajectory sweep
-# ============================================================================
 
 
 def sweep_trajectory(policy: GrootSimPolicy,
@@ -266,7 +194,6 @@ def sweep_trajectory(policy: GrootSimPolicy,
     rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(seed)
 
-    # For variant C we may need a previous-frame ys per timestep.
     for step_idx, entry in enumerate(entries):
         try:
             obs = build_obs(entry)
@@ -293,15 +220,12 @@ def sweep_trajectory(policy: GrootSimPolicy,
         stage1 = _load_stage1_arrays(maps_dir, entry["example_id"])
         sal = _load_saliency_arrays(saliency_dir, entry["example_id"])
 
-        # If the per-step Stage-1 map is missing, fall back to the closest neighbour
-        # in the same episode (so action_causal still works on those steps).
         if stage1 is None and maps_dir is not None:
             for nb in entries:
                 cand = _load_stage1_arrays(maps_dir, nb["example_id"])
                 if cand is not None:
                     stage1 = cand; break
 
-        # Build importance per method
         importance_per_method: dict[str, np.ndarray] = {}
         for m in methods:
             imp = _load_method_map(
@@ -376,11 +300,6 @@ def sweep_trajectory(policy: GrootSimPolicy,
             for r in rows:
                 w.writerow(r)
     return rows
-
-
-# ============================================================================
-# Driver
-# ============================================================================
 
 
 def main() -> None:

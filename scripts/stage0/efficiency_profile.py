@@ -1,38 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0 / E0.8 — Profiling and Compute Measurement for DreamZero-DROID.
+"""Stage 0: Profile latency, memory, and batch scaling for DreamZero inference.
 
-A complete efficiency test suite. Implements all five Stage-0.8 sub-experiments
-and emits paper-ready artifacts that downstream stages (perturbation, allocation)
-use to design block sizes and batching strategies.
-
-    E0.8a — End-to-end latency breakdown (preprocessing, text/image/VAE encoder,
-            DiT, VAE decoder, action extraction). CUDA-event accurate.
-    E0.8b — GPU memory: parameters, peak, reserved, KV cache, cross-attention
-            cache, activation memory.
-    E0.8c — Batch-size scaling (1, 2, 4, 8): latency, throughput, memory,
-            scaling efficiency, projected speedup for batched perturbation.
-    E0.8d — Scaling with diffusion steps and image resolution. Reports latency,
-            memory, action variance.
-    E0.8e — Perturbation-cost projection. Given a candidate block grid, project
-            sequential vs batched forward-pass cost using E0.8a/c numbers.
-
-Per-experiment artifacts (CSV + JSON + PNG/PDF figures) under <output_dir>/<exp>.
-Top-level: combined_report.md, combined_report.json, plus a paper-ready
-summary table baseline_efficiency.csv.
-
-Example:
-
-    python scripts/stage0/efficiency_profile.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 3 \\
-        --num_warmup 2 \\
-        --num_runs 8 \\
-        --batch_sizes 1,2,4,8 \\
-        --diffusion_steps 1,2,4,8 \\
-        --resolutions 180x320,128x224 \\
-        --block_sizes "1x1x1,1x2x2,1x4x4,1x8x8,1x16x16" \\
-        --output_dir runs/stage0_efficiency
+Projects perturbation cost to guide block sizes and runtime budgets in later stages.
 """
 
 from __future__ import annotations
@@ -77,11 +46,6 @@ from _common import (  # noqa: E402
     init_dist_single_process,
     reset_causal_state,
 )
-
-
-# ============================================================================
-# CUDA-event timing hooks
-# ============================================================================
 
 
 @dataclass
@@ -185,11 +149,6 @@ def _collect_timer_breakdown(timers: dict[str, StageTimer], total_wall_s: float)
     return out
 
 
-# ============================================================================
-# Memory measurement
-# ============================================================================
-
-
 def _module_param_bytes(module: Any) -> int:
     try:
         return sum(p.numel() * p.element_size() for p in module.parameters())
@@ -260,11 +219,6 @@ def _capture_memory(policy: GrootSimPolicy) -> MemoryReport:
         activation_bytes_estimate=activation_est,
         after_inference_alloc_bytes=after_alloc,
     )
-
-
-# ============================================================================
-# Inference primitives
-# ============================================================================
 
 
 def _replicate_obs(obs: dict[str, Any], batch_size: int) -> dict[str, Any]:
@@ -354,11 +308,6 @@ def _run_one(policy: GrootSimPolicy, obs: dict[str, Any],
     breakdown = _collect_timer_breakdown(timers, elapsed) if timers else {"total_ms": elapsed * 1000.0}
     mem = _capture_memory(policy)
     return elapsed, chunk, breakdown, mem
-
-
-# ============================================================================
-# Sub-experiments
-# ============================================================================
 
 
 def run_e0_8a(policy: GrootSimPolicy, examples: list[tuple[str, dict[str, Any]]],
@@ -623,7 +572,6 @@ def run_e0_8e(policy: GrootSimPolicy, examples: list[tuple[str, dict[str, Any]]]
         return {"skipped": True}
 
     shape = list(video_pred.shape)
-    # Expect (B, T_lat, C, H_lat, W_lat); be tolerant about ordering.
     if len(shape) < 4:
         (out_dir / "summary.json").write_text(json.dumps({"skipped": True,
                                                           "reason": f"unexpected video_pred shape {shape}"},
@@ -699,11 +647,6 @@ def run_e0_8e(policy: GrootSimPolicy, examples: list[tuple[str, dict[str, Any]]]
 
     _plot_e0_8e(rows, out_dir, batch_latencies)
     return summary
-
-
-# ============================================================================
-# Plotting
-# ============================================================================
 
 
 def _save_fig(fig, base: Path) -> None:
@@ -848,7 +791,6 @@ def _plot_e0_8c(summary: dict[str, Any], out_dir: Path) -> None:
     fig.tight_layout()
     _save_fig(fig, out_dir / "plot_memory_vs_batch")
 
-    # Efficiency
     if eff and any(e for e in eff):
         fig, ax = plt.subplots(figsize=(5.2, 3.0))
         ax.plot(Bs, eff, "o-", color="#7a4dab")
@@ -943,11 +885,6 @@ def _plot_e0_8e(rows: list[dict[str, Any]], out_dir: Path,
     ax.set_title("E0.8e — Batched perturbation speedup")
     fig.tight_layout()
     _save_fig(fig, out_dir / "plot_perturbation_speedup")
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
 
 
 def _stats(values: Iterable[float]) -> dict[str, Any]:
@@ -1144,11 +1081,6 @@ def _build_combined_report(out_dir: Path,
     (out_dir / "combined_report.md").write_text("\n".join(lines))
 
 
-# ============================================================================
-# Driver
-# ============================================================================
-
-
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description=__doc__)
     p.add_argument("--checkpoint", required=True)
@@ -1264,7 +1196,6 @@ def main() -> None:
         "e0_8e": e_summary,
     }, indent=2))
 
-    # Paper-ready compact CSV
     with (out_dir / "baseline_efficiency.csv").open("w") as f:
         w = csv.writer(f)
         w.writerow(["metric", "value", "unit"])

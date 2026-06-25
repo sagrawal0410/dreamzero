@@ -1,51 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 4 — CALA-WAM policy adapter for live closed-loop sim eval.
+"""Stage 4 adapter: Apply CALA-WAM retention masks during live inference.
 
-Wraps `GrootSimPolicy` so that every inference call is preceded by a
-CALA-WAM retention step on `head.ys`. Designed to drop into the existing
-websocket inference server (`socket_test_optimized_AR.py`) so that
-`eval_utils/run_sim_eval.py` can run real DROID Isaac-Lab rollouts with
-CALA-WAM allocation enabled.
-
-Three importance-providing strategies, picked by `--strategy`:
-
-    cached     : load a precomputed Stage-1 map for the *first observed
-                 example_id* and reuse it across the whole episode.
-                 Lowest overhead; assumes a cache for the start state.
-    attention  : run one cheap baseline forward, take the per-token norm
-                 of the last DiT block as the importance map (Stage-2 proxy).
-                 No precompute, but requires one extra forward per call.
-    dynamic    : compute a fresh action-causal map every K steps via a
-                 small perturbation sweep (expensive; reference-only).
-
-Usage
------
-
-This file exposes a `CalaWamPolicy` class that follows the
-`groot.vla.model.n1_5.sim_policy.GrootSimPolicy` API surface used by the
-existing servers (`forward`, `reset`, `lazy_joint_forward_causal`). Wiring
-into the AR-DROID server is intentionally minimal — replace the
-`policy = GrootSimPolicy(...)` line in `socket_test_optimized_AR.py` with:
-
-    from scripts.stage4.cala_wam_policy import CalaWamPolicy
-    policy = CalaWamPolicy(
-        embodiment_tag=EmbodimentTag(embodiment_tag),
-        model_path=model_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        device_mesh=device_mesh,
-        strategy="attention",
-        budget_pct=50.0,
-        variant="A_hard_retention",
-    )
-
-The class delegates everything else (transforms, distributed wiring, action
-unapply) to the wrapped `GrootSimPolicy`. Only `lazy_joint_forward_causal`
-is intercepted to apply the CALA-WAM mask.
-
-This file is a reference adapter; running real Isaac-Lab DROID rollouts
-additionally requires the `sim_evals` package set up per the project
-README. Use `scripts/stage4/closed_loop_compute.py` for the offline
-trajectory-replay metric reported in the paper tables.
+Wraps GrootSimPolicy to mask head.ys before the joint forward pass.
 """
 
 from __future__ import annotations
@@ -83,11 +39,6 @@ import perturbation_suite as ps  # noqa: E402
 from allocation_compute import _build_perturbed_ys, _load_method_map  # noqa: E402
 
 
-# ============================================================================
-# Importance providers
-# ============================================================================
-
-
 def _resolve(obj: Any, path: str) -> Any:
     cur = obj
     for part in path.split("."):
@@ -121,7 +72,6 @@ class CachedImportanceProvider:
         T, H, W = int(ys_shape[2]), int(ys_shape[3]), int(ys_shape[4])
         if self._cached_map is not None:
             return self._cached_map
-        # Search for any heatmap under cache_dir; pick the first available one.
         if not self.cache_dir.exists():
             return None
         for sub in sorted(self.cache_dir.iterdir()):
@@ -135,7 +85,6 @@ class CachedImportanceProvider:
             if key not in z.files:
                 continue
             arr = z[key].astype(np.float32)
-            # Resize if shape mismatches the live latent grid.
             if arr.shape != (T, H, W):
                 import cv2
                 arr2 = np.nanmean(arr, axis=0) if arr.ndim == 3 else arr
@@ -180,11 +129,6 @@ class AttentionImportanceProvider:
             [cv2.resize(arr[t].astype(np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
              for t in range(T)], axis=0)
         return out_resized
-
-
-# ============================================================================
-# CALA-WAM-wrapped policy
-# ============================================================================
 
 
 class CalaWamPolicy(GrootSimPolicy):
@@ -241,12 +185,10 @@ class CalaWamPolicy(GrootSimPolicy):
         logger.info("CalaWamPolicy: strategy=%s budget_pct=%g variant=%s",
                     strategy, budget_pct, variant)
 
-    # ---------------------------------------------------------------- forward
     def lazy_joint_forward_causal(self, batch: Batch, video: Any | None = None,
                                   latent_video: Any | None = None,
                                   state: Any | None = None,
                                   video_only: bool = False, **kwargs: Any):
-        # Bypass CALA-WAM during warmup or whenever budget == 100%.
         self._cala_call_count += 1
         if self._cala_call_count <= self._cala_bypass or self._cala_budget >= 100.0 - 1e-6:
             return super().lazy_joint_forward_causal(
@@ -254,10 +196,6 @@ class CalaWamPolicy(GrootSimPolicy):
                 state=state, video_only=video_only, **kwargs,
             )
 
-        # We need the baseline ys and clip_feas to apply retention. Use the
-        # same monkey-patch trick as Stage-0 perturbation_suite. If the
-        # attention strategy is active, also install a hook on the last DiT
-        # block to capture activations during the baseline forward.
         head = self.trained_model.action_head
         cache: dict[str, Any] = {}
         original = head.encode_image
@@ -300,7 +238,6 @@ class CalaWamPolicy(GrootSimPolicy):
                 state=state, video_only=video_only, **kwargs,
             )
 
-        # Acquire importance map
         importance = None
         try:
             importance = self._cala_provider.get(ys_base.shape, batch.obs)
@@ -314,14 +251,12 @@ class CalaWamPolicy(GrootSimPolicy):
                 state=state, video_only=video_only, **kwargs,
             )
 
-        # Apply retention/compression and run a perturbed forward
         z_ch_start = 4 if ys_base.shape[1] > 4 else 0
         ys_perturbed = _build_perturbed_ys(
             self._cala_variant, ys_base.clone(), importance.astype(np.float32),
             self._cala_budget, z_ch_start, prev_ys=None,
         )
 
-        # Replay forward with patched encode_image returning ys_perturbed
         def returning(image, num_frames, height, width):
             ni = cache["new_image"]
             ni_ret = ni.clone() if torch.is_tensor(ni) else ni
@@ -335,11 +270,6 @@ class CalaWamPolicy(GrootSimPolicy):
             )
         finally:
             head.encode_image = original
-
-
-# ============================================================================
-# Standalone CLI: smoke-test the wrapper on a manifest entry
-# ============================================================================
 
 
 def _smoke() -> None:

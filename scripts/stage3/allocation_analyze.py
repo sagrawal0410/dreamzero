@@ -1,47 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 3 / Analyze — Pareto frontier, main table, contact / robustness slices.
+"""Stage 3 analyze: Pareto curves and method tables from allocation sweeps.
 
-Reads `all_rows.csv` (and per-example rows) produced by `allocation_compute.py`
-and emits every Stage-3 paper deliverable:
-
-    E3.1 — Matched-budget action error per method (per variant), with paired-
-            seed deltas vs the action-causal map.
-    E3.2 — Latency / approx-throughput summary (uses budget as a linear-saving
-            proxy; real wall time per forward is also reported).
-    E3.3 — Pareto frontier:  retained-fraction → action error
-                              and effective-latency-ratio → action error.
-    E3.4 — Contact-heavy subset (task_group == B_contact_sensitive) breakdown.
-    E3.5 — Distractor / clutter robustness slice (task_group == C_distractor).
-    Main table — Method × Budget × Latency × Action-Err × Future-Err.
-
-Outputs:
-
-    runs/stage3_analysis/
-        e3_1_action_error/
-            mean_action_l2_per_method_budget.csv
-            plot_action_l2_vs_budget.png/.pdf
-            plot_action_first_vs_budget.png/.pdf
-        e3_2_latency/
-            latency_table.csv
-            plot_latency_per_budget.png/.pdf
-        e3_3_pareto/
-            plot_pareto_action_l2.png/.pdf
-            plot_pareto_video_l2.png/.pdf
-        e3_4_contact_heavy/
-            plot_contact_action_error.png/.pdf
-            summary.json
-        e3_5_robustness/
-            plot_distractor_action_error.png/.pdf
-            summary.json
-        main_paper_table.csv          - Method × Budget rows
-        combined_report.md
-        combined_report.json
-
-Run:
-
-    python scripts/stage3/allocation_analyze.py \\
-        --rows runs/stage3_alloc/all_rows.csv \\
-        --output_dir runs/stage3_analysis
+Plots action error vs budget, latency proxies, and contact/distractor slices.
 """
 
 from __future__ import annotations
@@ -88,11 +48,6 @@ METHOD_LABELS = {
 METHOD_IS_OURS = {"action_causal", "cala_wam_hybrid"}
 
 
-# ============================================================================
-# Loading / coercion
-# ============================================================================
-
-
 def _coerce(v: Any) -> Any:
     if isinstance(v, str):
         s = v
@@ -115,11 +70,6 @@ def _load_rows(rows_csv: Path) -> list[dict[str, Any]]:
         for r in rd:
             rows.append({k: _coerce(v) for k, v in r.items()})
     return rows
-
-
-# ============================================================================
-# Aggregation primitives
-# ============================================================================
 
 
 def _key_in(rows: list[dict[str, Any]], k: str) -> set[Any]:
@@ -163,11 +113,6 @@ def _ordered_methods(present: Iterable[str]) -> list[str]:
     return [m for m in METHOD_DISPLAY_ORDER if m in seen] + [m for m in seen if m not in METHOD_DISPLAY_ORDER]
 
 
-# ============================================================================
-# Plot helpers
-# ============================================================================
-
-
 def _save_fig(fig, base: Path) -> None:
     base.parent.mkdir(parents=True, exist_ok=True)
     for ext in (".png", ".pdf"):
@@ -200,11 +145,6 @@ def _styles_for_methods(methods: list[str]) -> dict[str, dict[str, Any]]:
         else:
             styles[m] = {"linestyle": "--", "linewidth": 1.2, "marker": "s", "markersize": 4}
     return styles
-
-
-# ============================================================================
-# E3.1 — action error vs budget
-# ============================================================================
 
 
 def plot_metric_vs_budget(rows: list[dict[str, Any]], out_dir: Path,
@@ -246,11 +186,6 @@ def plot_metric_vs_budget(rows: list[dict[str, Any]], out_dir: Path,
     fig.tight_layout()
     _save_fig(fig, out_dir / fname)
     return {m: table[m] for m in methods}
-
-
-# ============================================================================
-# E3.2 — latency table
-# ============================================================================
 
 
 def latency_table(rows: list[dict[str, Any]], out_dir: Path) -> dict[str, Any]:
@@ -298,11 +233,6 @@ def latency_table(rows: list[dict[str, Any]], out_dir: Path) -> dict[str, Any]:
     return {"rows": rows_csv}
 
 
-# ============================================================================
-# E3.3 — Pareto frontier
-# ============================================================================
-
-
 def plot_pareto(rows: list[dict[str, Any]], out_dir: Path,
                 variant: str, error_metric: str,
                 fname: str, title: str) -> None:
@@ -335,11 +265,6 @@ def plot_pareto(rows: list[dict[str, Any]], out_dir: Path,
     ax.legend(frameon=False, fontsize=8, ncol=2, loc="best")
     fig.tight_layout()
     _save_fig(fig, out_dir / fname)
-
-
-# ============================================================================
-# E3.4 / E3.5 — task-group breakdowns
-# ============================================================================
 
 
 def plot_subset_action(rows: list[dict[str, Any]], out_dir: Path,
@@ -379,11 +304,6 @@ def plot_subset_action(rows: list[dict[str, Any]], out_dir: Path,
     return {"means": out, "n_examples": len({r["example_id"] for r in sub})}
 
 
-# ============================================================================
-# Main paper table
-# ============================================================================
-
-
 def write_main_paper_table(rows: list[dict[str, Any]], out_path: Path,
                             variant: str = "A_hard_retention") -> list[dict[str, Any]]:
     sub = _filter(rows, variant=variant) if variant else rows
@@ -417,11 +337,6 @@ def write_main_paper_table(rows: list[dict[str, Any]], out_path: Path,
             for r in out_rows:
                 w.writerow(r)
     return out_rows
-
-
-# ============================================================================
-# Combined report
-# ============================================================================
 
 
 def write_combined_report(out_dir: Path, rows: list[dict[str, Any]],
@@ -495,11 +410,6 @@ def write_combined_report(out_dir: Path, rows: list[dict[str, Any]],
     (out_dir / "combined_report.md").write_text("\n".join(lines))
 
 
-# ============================================================================
-# Driver
-# ============================================================================
-
-
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description=__doc__)
     p.add_argument("--rows", required=True, help="Path to all_rows.csv from allocation_compute.")
@@ -520,7 +430,6 @@ def main() -> None:
         logger.error("Empty rows file: %s", rows_path); sys.exit(1)
     logger.info("Loaded %d rows from %s", len(rows), rows_path)
 
-    # E3.1
     e31_dir = out_dir / "e3_1_action_error"
     plot_metric_vs_budget(
         rows, e31_dir, variant=args.main_variant,
@@ -534,7 +443,6 @@ def main() -> None:
         title=f"E3.1 — action-first L2 vs retention budget  ({args.main_variant})",
         fname="plot_action_first_vs_budget",
     )
-    # CSV: per (method, budget) means
     methods = _ordered_methods(_key_in(_filter(rows, variant=args.main_variant), "method"))
     budgets = sorted(_key_in(_filter(rows, variant=args.main_variant), "budget_pct"))
     e31_csv = e31_dir / "mean_action_l2_per_method_budget.csv"
@@ -550,12 +458,10 @@ def main() -> None:
             w.writerow(row)
     logger.info("E3.1 -> %s", e31_dir)
 
-    # E3.2 latency
     e32_dir = out_dir / "e3_2_latency"
     latency_summary = latency_table(rows, e32_dir)
     logger.info("E3.2 -> %s", e32_dir)
 
-    # E3.3 Pareto
     e33_dir = out_dir / "e3_3_pareto"
     plot_pareto(rows, e33_dir, variant=args.main_variant,
                 error_metric="action_l2",
@@ -567,7 +473,6 @@ def main() -> None:
                 title="E3.3 — Pareto frontier  (retained fraction → video L2)")
     logger.info("E3.3 -> %s", e33_dir)
 
-    # E3.4 contact-heavy
     e34_dir = out_dir / "e3_4_contact_heavy"
     contact_summary = plot_subset_action(
         rows, e34_dir, task_group="B_contact_sensitive",
@@ -578,7 +483,6 @@ def main() -> None:
     (e34_dir / "summary.json").write_text(json.dumps(contact_summary, indent=2))
     logger.info("E3.4 -> %s", e34_dir)
 
-    # E3.5 distractor / clutter robustness
     e35_dir = out_dir / "e3_5_robustness"
     robustness_summary = plot_subset_action(
         rows, e35_dir, task_group="C_distractor",
@@ -589,11 +493,9 @@ def main() -> None:
     (e35_dir / "summary.json").write_text(json.dumps(robustness_summary, indent=2))
     logger.info("E3.5 -> %s", e35_dir)
 
-    # Main paper table
     main_table = write_main_paper_table(rows, out_dir / "main_paper_table.csv",
                                         variant=args.main_variant)
 
-    # Combined report
     write_combined_report(out_dir, rows, main_table, contact_summary, robustness_summary)
     (out_dir / "combined_report.json").write_text(json.dumps({
         "main_variant": args.main_variant,

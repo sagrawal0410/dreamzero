@@ -1,69 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 5 / Train — Distil Stage-1 perturbation maps into a lightweight allocator.
+"""Stage 5 train: Distill Stage 1 heatmaps into a lightweight allocator model.
 
-Implements **E5.1 distillation** training. Also covers:
-
-    * E5.3 generalization splits — pass `--val_groups C_distractor,D_global_context`
-      (or any subset of task-group names) and the train/val split is by group
-      instead of random. Use this to test allocator generalization to unseen
-      task families.
-    * E5.4 input ablations — pass `--ablation` to launch four sequential runs
-      with the standard input combinations, each writing its own subfolder and
-      checkpoint:
-        vision_only, vision_lang, vision_proprio, vision_lang_proprio_history.
-
-Dataset
--------
-`PerturbMapDataset` (see `allocator_model.py`) reads:
-
-    runs/stage1_maps/<example_id>/heatmaps.npz   ← target action-causal map
-    runs/stage0_suite/manifest.json              ← image path, proprio, instruction,
-                                                   episode → action history
-
-The target heatmap is L1-normalised to a probability simplex; the loss is
-KL-divergence + a Spearman-style soft-rank term to encourage correct
-ordering. Standard MSE is also reported for compatibility with paper
-appendix tables.
-
-Example (single run):
-
-    python scripts/stage5/train_allocator.py \\
-        --maps_dir runs/stage1_maps \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --epochs 60 --batch_size 16 --lr 1e-3 \\
-        --use_lang --use_proprio --use_history \\
-        --output_dir runs/stage5_allocator/full
-
-Example (E5.4 input ablations, one shell call, four runs):
-
-    python scripts/stage5/train_allocator.py \\
-        --maps_dir runs/stage1_maps \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --epochs 60 --batch_size 16 \\
-        --ablation \\
-        --output_dir runs/stage5_allocator_ablation
-
-Example (E5.3 generalization, hold out distractor + global-context tasks):
-
-    python scripts/stage5/train_allocator.py \\
-        --maps_dir runs/stage1_maps \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --val_groups C_distractor,D_global_context \\
-        --epochs 60 --batch_size 16 \\
-        --output_dir runs/stage5_allocator_generalization
-
-Outputs (per run directory):
-
-    config.json                — hyperparameters and the input-ablation flags.
-    train_log.csv              — per-epoch train/val loss + map metrics.
-    train_log.json             — same content, JSON.
-    allocator.pt               — best-val checkpoint (state_dict + config).
-    predicted_maps/<id>/heatmaps.npz   — predicted maps in Stage-1 layout
-                                        for every val example (and train if
-                                        --dump_train_predictions is set).
-    plots/plot_loss_curve.png  - training-loss curve.
-    plots/plot_val_metrics.png - val metric curves over epochs.
-    summary.json               — final-epoch + best-epoch metrics.
+Trains a CNN to predict action-causal maps from vision, language, and proprio inputs.
 """
 
 from __future__ import annotations
@@ -97,11 +35,6 @@ from allocator_model import (  # noqa: E402
 STAGE0_DIR = SCRIPT_DIR.parent / "stage0"
 sys.path.insert(0, str(STAGE0_DIR))
 from _common import configure_neurips_matplotlib  # noqa: E402
-
-
-# ============================================================================
-# Loss
-# ============================================================================
 
 
 def _kl_div(pred_logits: torch.Tensor, target_prob: torch.Tensor) -> torch.Tensor:
@@ -144,11 +77,6 @@ def composite_loss(pred_logits: torch.Tensor, target_prob: torch.Tensor,
                    "total": float(total.item())}
 
 
-# ============================================================================
-# Eval
-# ============================================================================
-
-
 @torch.no_grad()
 def evaluate(model: Allocator, loader: DataLoader, device: str,
              k_pcts: list[float]) -> dict[str, Any]:
@@ -169,7 +97,6 @@ def evaluate(model: Allocator, loader: DataLoader, device: str,
         pred_lat_ms.append((time.perf_counter() - t0) * 1000.0 / max(1, image.shape[0]))
         loss, _logs = composite_loss(pred_logits, target)
         losses.append(float(loss.item()))
-        # Convert to probability for metric computation (softmax over flattened)
         B, H, W = pred_logits.shape
         prob = F.softmax(pred_logits.view(B, -1), dim=-1).view(B, H, W).cpu().numpy()
         tgt = target.cpu().numpy()
@@ -213,11 +140,6 @@ def dump_predictions(model: Allocator, loader: DataLoader, device: str,
     return n
 
 
-# ============================================================================
-# Training driver (single config)
-# ============================================================================
-
-
 def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -228,7 +150,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     if device.startswith("cuda"):
         torch.cuda.manual_seed_all(rng_seed)
 
-    # Dataset
     dataset = PerturbMapDataset(
         maps_dir=Path(cfg["maps_dir"]),
         manifest_path=Path(cfg["task_suite"]),
@@ -264,7 +185,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     val_loader = DataLoader(val_set, batch_size=cfg["batch_size"], shuffle=False,
                             num_workers=cfg["num_workers"], drop_last=False)
 
-    # Model
     target_shape = train_set.target_shape if train_set.target_shape != (0, 0) else val_set.target_shape
     model = Allocator(
         image_size=tuple(cfg["image_size"]),
@@ -333,7 +253,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             row.get("val_pred_latency_ms", float("nan")),
         )
 
-        # Best checkpoint
         cur = row.get(primary_metric_name)
         if cur is not None and not (isinstance(cur, float) and math.isnan(cur)) and cur > best_val_pearson:
             best_val_pearson = float(cur)
@@ -341,7 +260,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                         "epoch": epoch, "metrics": row}, best_path)
 
     elapsed = time.perf_counter() - epoch_t0
-    # Persist log
     with (out_dir / "train_log.csv").open("w") as f:
         if log_rows:
             w = csv.DictWriter(f, fieldnames=list(log_rows[0].keys()))
@@ -350,7 +268,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                 w.writerow(r)
     (out_dir / "train_log.json").write_text(json.dumps(log_rows, indent=2))
 
-    # Reload best for final eval / dumps
     if best_path.exists():
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["state_dict"])
@@ -358,7 +275,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
                     ckpt.get("epoch", -1), primary_metric_name,
                     ckpt.get("metrics", {}).get(primary_metric_name, float("nan")))
 
-    # Dump predictions for val (always) + train (optional)
     dump_dir = out_dir / "predicted_maps"
     n_val = dump_predictions(model, val_loader, device, dump_dir,
                               cfg["primary_operator"], cfg["primary_metric"],
@@ -371,7 +287,6 @@ def train_one_config(cfg: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         n_tr = 0
     logger.info("Dumped predictions: %d val + %d train -> %s", n_val, n_tr, dump_dir)
 
-    # Final summary + plots
     final = log_rows[-1] if log_rows else {}
     best_row = max(log_rows, key=lambda r: (r.get(primary_metric_name) or -math.inf)) if log_rows else {}
     summary = {
@@ -428,11 +343,6 @@ def _plot_training_curves(log_rows: list[dict[str, Any]], out_dir: Path) -> None
     plt.close(fig)
 
 
-# ============================================================================
-# Ablation orchestrator (E5.4)
-# ============================================================================
-
-
 ABLATION_VARIANTS = {
     "vision_only":             {"use_lang": False, "use_proprio": False, "use_history": False},
     "vision_lang":             {"use_lang": True,  "use_proprio": False, "use_history": False},
@@ -460,11 +370,6 @@ def run_ablation(base_cfg: dict[str, Any], out_root: Path) -> dict[str, Any]:
     return summaries
 
 
-# ============================================================================
-# CLI
-# ============================================================================
-
-
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter,
                                 description=__doc__)
@@ -475,7 +380,6 @@ def main() -> None:
     p.add_argument("--output_dir", required=True)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=0)
-    # Optimisation
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -483,7 +387,6 @@ def main() -> None:
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--w_kl", type=float, default=1.0)
     p.add_argument("--w_rank", type=float, default=0.5)
-    # Splits
     p.add_argument("--val_fraction", type=float, default=0.2,
                    help="Random val fraction when --val_groups is empty.")
     p.add_argument("--train_groups", default="",
@@ -493,7 +396,6 @@ def main() -> None:
                    help="Comma-separated task groups for the val split. If set, "
                         "examples in these groups are held out for validation "
                         "(E5.3 generalization).")
-    # Inputs / architecture
     p.add_argument("--image_height", type=int, default=180)
     p.add_argument("--image_width", type=int, default=320)
     p.add_argument("--target_h", type=int, default=11)
@@ -510,7 +412,6 @@ def main() -> None:
     p.add_argument("--no_proprio", dest="use_proprio", action="store_false")
     p.add_argument("--use_history", action="store_true", default=True)
     p.add_argument("--no_history", dest="use_history", action="store_false")
-    # Stage-1 source
     p.add_argument("--primary_operator", default="local_mean")
     p.add_argument("--primary_metric", default="action_l2")
     p.add_argument("--top_k_pcts", default="5,10,20",

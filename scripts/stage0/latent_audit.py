@@ -1,32 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0 / E0.2 — Latent Access Sanity for DreamZero-DROID.
+"""Stage 0: Audit which model latents are accessible for perturbation.
 
-Pinpoints exactly which latent tensors you can access and perturb. For one
-example from the Stage-0 manifest, this:
-
-  1. Registers forward hooks on the action head's VAE encoder/decoder, the
-     CLIP image encoder, the T5 text encoder, the WAN DiT patch embedding,
-     and a few transformer blocks (first / middle / last).
-  2. Captures stored attributes set during forward (`clip_feas`, `ys`,
-     encoded language).
-  3. Runs ONE inference call and records every captured tensor's shape /
-     dtype / spatial-temporal layout.
-  4. Tries to VAE-decode the predicted future-video latents (the DiT output)
-     so you can confirm spatial alignment back to pixels.
-  5. Writes:
-
-         latent_audit.json   — full structured record
-         latent_audit.csv    — per-tensor table
-         latent_audit.md     — paper-appendix-ready Markdown table
-         decoded_video_pred.mp4 — decoded future video (sanity)
-
-Example:
-
-    python scripts/stage0/latent_audit.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --example_index 0 \\
-        --output_dir runs/stage0_latents
+Hooks one forward pass and documents tensor shapes plus a decoded video sanity check.
 """
 
 from __future__ import annotations
@@ -67,11 +42,6 @@ from _common import (  # noqa: E402
     init_dist_single_process,
     reset_causal_state,
 )
-
-
-# ----------------------------------------------------------------------------
-# Hook record
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -120,11 +90,6 @@ def _classify_layout(shape: list[int], hint: str) -> tuple[bool, bool]:
     return False, False
 
 
-# ----------------------------------------------------------------------------
-# Module discovery (best-effort)
-# ----------------------------------------------------------------------------
-
-
 def _resolve(obj: Any, path: str) -> Any:
     cur = obj
     for part in path.split("."):
@@ -144,7 +109,6 @@ def _candidate_modules(head: Any) -> list[tuple[str, Any]]:
         if m is not None and hasattr(m, "register_forward_hook"):
             out.append((path, m))
 
-    # CLIP image encoder
     for path in ("image_encoder", "image_encoder.model", "image_encoder.model.visual"):
         m = _resolve(head, path)
         if m is not None and hasattr(m, "register_forward_hook"):
@@ -175,11 +139,6 @@ def _candidate_modules(head: Any) -> list[tuple[str, Any]]:
             out.append(("model.head", dit.head))
 
     return out
-
-
-# ----------------------------------------------------------------------------
-# Hook installation
-# ----------------------------------------------------------------------------
 
 
 def install_hooks(head: Any) -> tuple[dict[str, dict[str, Any]], list[Any]]:
@@ -216,11 +175,6 @@ def install_hooks(head: Any) -> tuple[dict[str, dict[str, Any]], list[Any]]:
     return records, handles
 
 
-# ----------------------------------------------------------------------------
-# VAE decode helper (re-used in eval_baseline.py)
-# ----------------------------------------------------------------------------
-
-
 def decode_video_latents(head: Any, video_pred: torch.Tensor, out_path: Path) -> bool:
     try:
         import imageio
@@ -249,11 +203,6 @@ def decode_video_latents(head: Any, video_pred: torch.Tensor, out_path: Path) ->
     except Exception as e:
         logger.warning("VAE decode failed: %s", e)
         return False
-
-
-# ----------------------------------------------------------------------------
-# Build the audit table
-# ----------------------------------------------------------------------------
 
 
 def _build_records(
@@ -345,11 +294,6 @@ def _build_records(
     return rows
 
 
-# ----------------------------------------------------------------------------
-# Pretty writers
-# ----------------------------------------------------------------------------
-
-
 def _write_csv(rows: list[TensorRecord], out: Path) -> None:
     with out.open("w") as f:
         w = csv.writer(f)
@@ -382,11 +326,6 @@ def _write_md(rows: list[TensorRecord], out: Path, header: dict[str, Any]) -> No
             f"{r.notes} |"
         )
     out.write_text("\n".join(lines) + "\n")
-
-
-# ----------------------------------------------------------------------------
-# Driver
-# ----------------------------------------------------------------------------
 
 
 def run_audit(args: argparse.Namespace) -> None:

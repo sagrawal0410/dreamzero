@@ -1,48 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0 / E0.3 — Baseline Action Stability for DreamZero-DROID.
+"""Stage 0: Measure baseline action sampling variance (noise floor).
 
-Measures the **natural sampling variance** of unmodified DreamZero so that
-later perturbation deltas can be judged against a real noise floor. Implements
-all five Stage-0 stability sub-experiments and emits paper-ready artifacts:
-
-    E0.3a — Same input, same seed (determinism check, expected ≈ 0).
-    E0.3b — Same input, different seeds (the "noise floor").
-    E0.3c — Diffusion-step ablation (1 / 2 / 4 / default DiT steps).
-    E0.3d — Sampling-parameter sweep (sigma_shift if exposed).
-    E0.3e — Per-horizon stability (early vs late action variance).
-
-For each experiment we save:
-
-    <out>/<exp>/per_example.csv         — long-form table, one row per run.
-    <out>/<exp>/summary.json            — aggregate stats.
-    <out>/<exp>/plot_*.png   plot_*.pdf — NeurIPS-style figures.
-
-In addition we write:
-
-    <out>/noise_floor.json    — per-horizon, per-dim seed-σ used as the
-                                significance threshold for later stages.
-    <out>/combined_report.md  — paper-appendix-ready summary with embedded
-                                figure links and the headline numbers.
-
-Example:
-
-    python scripts/stage0/stability_analysis.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 3 \\
-        --num_seeds 16 \\
-        --num_determinism_runs 8 \\
-        --diffusion_steps 1,2,4,8 \\
-        --sigma_shifts 3.0,5.0,7.0 \\
-        --output_dir runs/stage0_stability
-
-Notes
------
-* Runs as a single process. GrootSimPolicy initialises a 1-rank gloo group.
-* The diffusion-step override mutates `head.num_inference_steps` and
-  `head.dit_step_mask` for the duration of the run. We always restore them.
-* Sigma-shift sweep is best-effort — it is applied only if the action head
-  exposes `head.sigma_shift`. Otherwise E0.3d records `n/a`.
+Quantifies seed, diffusion-step, and horizon stability for significance thresholds in later stages.
 """
 
 from __future__ import annotations
@@ -87,11 +46,6 @@ from _common import (  # noqa: E402
     init_dist_single_process,
     reset_causal_state,
 )
-
-
-# ============================================================================
-# Inference primitives
-# ============================================================================
 
 
 @dataclass
@@ -203,11 +157,6 @@ def _run(policy: GrootSimPolicy, obs: dict[str, Any], seed: int,
         diffusion_steps_used=int(getattr(head, "num_inference_steps", -1)),
         sigma_shift_used=float(getattr(head, "sigma_shift", float("nan"))),
     )
-
-
-# ============================================================================
-# Plotting helpers
-# ============================================================================
 
 
 def _save_fig(fig, base: Path) -> None:
@@ -421,11 +370,6 @@ def _plot_e0_3e(seed_arrays_per_example: list[np.ndarray], out_dir: Path) -> Non
     _save_fig(fig, out_dir / "plot_horizon_stability")
 
 
-# ============================================================================
-# Sub-experiments
-# ============================================================================
-
-
 def run_e0_3a(policy: GrootSimPolicy, examples: list[tuple[str, dict[str, Any]]],
               num_runs: int, out_dir: Path) -> dict[str, Any]:
     """Same input, same seed → expected ≈ 0 across runs."""
@@ -583,7 +527,6 @@ def run_e0_3c(policy: GrootSimPolicy, examples: list[tuple[str, dict[str, Any]]]
     _plot_e0_3c(rows, out_dir)
     _write_csv(rows, out_dir / "per_example.csv")
 
-    # Aggregate per step
     by_step: dict[int, dict[str, list[float]]] = {}
     for r in rows:
         d = by_step.setdefault(int(r["diffusion_steps"]), {"latency": [], "sigma": [], "l1": []})
@@ -694,7 +637,6 @@ def run_e0_3e(seed_arrays: list[np.ndarray], out_dir: Path) -> dict[str, Any]:
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    # Per-example CSV
     rows: list[dict[str, Any]] = []
     for i, a in enumerate(cropped):
         per_h = a.std(axis=0).mean(axis=-1)
@@ -703,11 +645,6 @@ def run_e0_3e(seed_arrays: list[np.ndarray], out_dir: Path) -> dict[str, Any]:
     _write_csv(rows, out_dir / "per_example.csv")
     _plot_e0_3e(seed_arrays, out_dir)
     return summary
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
 
 
 def _stats(values: Iterable[float]) -> dict[str, Any]:
@@ -826,11 +763,6 @@ def _build_combined_report(out_dir: Path,
              "    Δa_i > 2 × σ_seed_overall_p90  (single conservative threshold)",
              ""]
     (out_dir / "combined_report.md").write_text("\n".join(lines))
-
-
-# ============================================================================
-# Driver
-# ============================================================================
 
 
 def main() -> None:

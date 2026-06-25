@@ -1,35 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 4 / Analyze — Closed-loop trajectory figures and tables.
+"""Stage 4 analyze: Trajectory replay figures and compute-limited curves.
 
-Reads the rows produced by `closed_loop_compute.py` and emits every Stage-4
-deliverable:
-
-    E4.1 — Trajectory replay benchmark:
-             * mean trajectory action error per method
-             * per-episode error trajectories
-             * "rollout success" proxy = fraction of (episode, step) pairs
-               with action_l2_vs_gt below the configurable threshold.
-    E4.2 — Compute-limited curves (action error vs budget) per method,
-             both global and per-task-group.
-    E4.3 — Contact-sensitive subset (task_group == B_contact_sensitive,
-             role in {pre_contact, contact, post_contact}). Adds a
-             "gripper-event" slice using the GT-derived flag.
-    E4.4 — Distractor / clutter slice (task_group == C_distractor).
-    Rollout figure — Per-episode multi-row composite:
-             input frames (1 row per timestep) | retained-region overlays |
-             decoded baseline future video frames | action-error curve.
-    Main paper table — Method × Budget × {Latency, Action vs GT, Action
-             vs baseline, Gripper L2, Approx success-rate}.
-
-All figures are written as PNG + PDF at 300 DPI, paper rcParams.
-
-Run:
-
-    python scripts/stage4/closed_loop_analyze.py \\
-        --rows runs/stage4_closed_loop/all_rows.csv \\
-        --maps_dir runs/stage1_maps \\
-        --saliency_dir runs/stage2_saliency \\
-        --output_dir runs/stage4_analysis
+Summarizes per-episode error, success proxies, and budget sweeps by task group.
 """
 
 from __future__ import annotations
@@ -55,7 +27,6 @@ sys.path.insert(0, str(STAGE0_DIR))
 from _common import configure_neurips_matplotlib  # noqa: E402
 
 
-# Display order / palette (mirror Stage 3 for visual consistency)
 METHOD_DISPLAY_ORDER = [
     "action_causal", "cala_wam_hybrid",
     "object", "attention", "flow", "gripper",
@@ -75,11 +46,6 @@ METHOD_LABELS = {
 }
 METHOD_IS_OURS = {"action_causal", "cala_wam_hybrid"}
 PHASE_ORDER = ["initial", "approach", "pre_contact", "contact", "post_contact"]
-
-
-# ============================================================================
-# Loading helpers
-# ============================================================================
 
 
 def _coerce(v: Any) -> Any:
@@ -148,11 +114,6 @@ def _stats(values: Iterable[float]) -> dict[str, Any]:
             "std": float(arr.std())}
 
 
-# ============================================================================
-# Plot helpers
-# ============================================================================
-
-
 def _save_fig(fig, base: Path) -> None:
     base.parent.mkdir(parents=True, exist_ok=True)
     for ext in (".png", ".pdf"):
@@ -186,11 +147,6 @@ def _styles(methods: list[str]) -> dict[str, dict[str, Any]]:
     return s
 
 
-# ============================================================================
-# E4.1 — trajectory replay benchmark
-# ============================================================================
-
-
 def plot_trajectory_error_per_method(rows: list[dict[str, Any]], out_dir: Path,
                                       variant: str, budget: float,
                                       x_field: str = "step_within_episode") -> None:
@@ -204,7 +160,6 @@ def plot_trajectory_error_per_method(rows: list[dict[str, Any]], out_dir: Path,
     fig, ax = plt.subplots(figsize=(6.4, 3.4))
     for m in methods:
         sm = _filter(sub, method=m)
-        # Aggregate over episodes: for each step index, compute mean across episodes
         by_step: dict[int, list[float]] = defaultdict(list)
         for r in sm:
             v = r.get("action_l2_vs_gt")
@@ -301,11 +256,6 @@ def plot_success_rate(out_dir: Path, success_summary: dict[str, Any], variant: s
     _save_fig(fig, out_dir / f"plot_success_rate_b{int(budget)}")
 
 
-# ============================================================================
-# E4.2 — compute-limited curves
-# ============================================================================
-
-
 def plot_compute_limited(rows: list[dict[str, Any]], out_dir: Path,
                           variant: str, metric: str, ylabel: str, fname: str,
                           task_group: str | None = None) -> None:
@@ -345,11 +295,6 @@ def plot_compute_limited(rows: list[dict[str, Any]], out_dir: Path,
     _save_fig(fig, out_dir / fname)
 
 
-# ============================================================================
-# E4.3 — contact-sensitive subset
-# ============================================================================
-
-
 def contact_subset_summary(rows: list[dict[str, Any]], variant: str,
                             out_dir: Path) -> dict[str, Any]:
     sub = [r for r in _filter(rows, variant=variant)
@@ -362,7 +307,6 @@ def contact_subset_summary(rows: list[dict[str, Any]], variant: str,
     plot_compute_limited(rows, out_dir, variant, "action_gripper",
                          "gripper L2 (contact-heavy)",
                          "plot_contact_gripper_error", task_group="B_contact_sensitive")
-    # Gripper-event sub-slice: rows where gripper transition happens at this step
     gripper_rows = [r for r in sub if int(r.get("gripper_event") or 0) == 1]
     methods = _ordered_methods(_key_in(sub, "method"))
     budgets = sorted(_key_in(sub, "budget_pct"))
@@ -385,11 +329,6 @@ def contact_subset_summary(rows: list[dict[str, Any]], variant: str,
     return summary
 
 
-# ============================================================================
-# E4.4 — distractor / clutter subset
-# ============================================================================
-
-
 def distractor_subset_summary(rows: list[dict[str, Any]], variant: str,
                                out_dir: Path) -> dict[str, Any]:
     sub = [r for r in _filter(rows, variant=variant) if r.get("task_group") == "C_distractor"]
@@ -410,11 +349,6 @@ def distractor_subset_summary(rows: list[dict[str, Any]], variant: str,
             }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
-
-
-# ============================================================================
-# Rollout figure
-# ============================================================================
 
 
 def _read_png(path: Path | None) -> np.ndarray | None:
@@ -494,7 +428,6 @@ def rollout_figure(rows: list[dict[str, Any]], out_dir: Path,
     if not sub:
         return None
     if episode_index is None:
-        # Pick the episode where the action_causal advantage over uniform is largest
         eps = sorted(_key_in(sub, "episode_index"))
         best_ep = None; best_gain = -np.inf
         for ep in eps:
@@ -515,25 +448,21 @@ def rollout_figure(rows: list[dict[str, Any]], out_dir: Path,
     )
     if not ep_rows:
         return None
-    # One row per (step, method); pick steps in order, prefer action_causal for the panel imagery
     steps = sorted({int(r["step_within_episode"]) for r in ep_rows})
     if not steps:
         return None
 
     n_steps = min(len(steps), 5)
     chosen_steps = steps[:n_steps]
-    # Build the figure layout with gridspec
     fig = plt.figure(figsize=(2.5 * n_steps + 0.5, 9.5))
     gs = fig.add_gridspec(4, n_steps, height_ratios=[1, 1, 1, 1.4], hspace=0.45, wspace=0.05)
 
     # Per-step panels: input | retained | future
     for c, s in enumerate(chosen_steps):
-        # Reference row for this step (action_causal preferred)
         ref_rows = [r for r in ep_rows if int(r["step_within_episode"]) == s]
         ref = next((r for r in ref_rows if r["method"] == "action_causal"), ref_rows[0])
         ex_id = ref["example_id"]
 
-        # Row 0: input frame
         input_path = (saliency_dir or Path(".")) / ex_id / "baseline_input.png"
         if not input_path.exists() and maps_dir is not None:
             input_path = maps_dir / ex_id / "baseline_input.png"
@@ -541,12 +470,10 @@ def rollout_figure(rows: list[dict[str, Any]], out_dir: Path,
         ax0 = fig.add_subplot(gs[0, c])
         _overlay(ax0, rgb, None, title=(f"input  t{s}" if c == 0 else f"t{s}"))
 
-        # Row 1: action-causal retained-region overlay (CALA-WAM)
         ax1 = fig.add_subplot(gs[1, c])
         ac_map = _heatmap_2d(maps_dir, ex_id, primary_op, primary_metric) if maps_dir else None
         _overlay(ax1, rgb, ac_map, title=("CALA-WAM retained" if c == 0 else ""))
 
-        # Row 2: decoded baseline future frame (use the future video t=0 frame)
         ax2 = fig.add_subplot(gs[2, c])
         future_mp4 = _decoded_future_path(saliency_dir or Path("."), ex_id) if saliency_dir else None
         future_frames = _read_video_first_n_frames(future_mp4, n=1) if future_mp4 else []
@@ -558,7 +485,6 @@ def rollout_figure(rows: list[dict[str, Any]], out_dir: Path,
         elif c == 0:
             ax2.set_title("future video (n/a)", fontsize=8)
 
-    # Row 3: action-error curve across all methods at chosen budget for this episode
     ax3 = fig.add_subplot(gs[3, :])
     methods = _ordered_methods(_key_in(ep_rows, "method"))
     palette = _palette(methods); styles = _styles(methods)
@@ -582,11 +508,6 @@ def rollout_figure(rows: list[dict[str, Any]], out_dir: Path,
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     _save_fig(fig, out_dir / f"rollout_episode_{episode_index:06d}_b{int(budget)}")
     return f"rollout_episode_{episode_index:06d}_b{int(budget)}"
-
-
-# ============================================================================
-# Main paper table
-# ============================================================================
 
 
 def write_main_paper_table(rows: list[dict[str, Any]], out_path: Path,
@@ -625,11 +546,6 @@ def write_main_paper_table(rows: list[dict[str, Any]], out_path: Path,
             for r in out_rows:
                 w.writerow(r)
     return out_rows
-
-
-# ============================================================================
-# Combined report
-# ============================================================================
 
 
 def write_combined_report(out_dir: Path, rows: list[dict[str, Any]],
@@ -726,11 +642,6 @@ def write_combined_report(out_dir: Path, rows: list[dict[str, Any]],
     (out_dir / "combined_report.md").write_text("\n".join(lines))
 
 
-# ============================================================================
-# Driver
-# ============================================================================
-
-
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter, description=__doc__)
     p.add_argument("--rows", required=True, help="Path to all_rows.csv from closed_loop_compute.")
@@ -762,7 +673,6 @@ def main() -> None:
         logger.error("Empty rows file: %s", rows_path); sys.exit(1)
     logger.info("Loaded %d rows", len(rows))
 
-    # E4.1
     e41_dir = out_dir / "e4_1_trajectory"
     plot_trajectory_error_per_method(rows, e41_dir, args.main_variant, args.success_budget)
     plot_per_phase_error(rows, e41_dir, args.main_variant, args.success_budget)
@@ -772,28 +682,23 @@ def main() -> None:
     (e41_dir / "summary.json").write_text(json.dumps(success_summary, indent=2))
     logger.info("E4.1 -> %s", e41_dir)
 
-    # E4.2
     e42_dir = out_dir / "e4_2_compute_limited"
     plot_compute_limited(rows, e42_dir, args.main_variant, "action_l2_vs_gt",
                          "action L2 vs GT", "plot_action_error_vs_budget")
-    # Per-task-group slices
     for tg in sorted({r.get("task_group") for r in rows if r.get("task_group")}):
         plot_compute_limited(rows, e42_dir, args.main_variant, "action_l2_vs_gt",
                              f"action L2 vs GT  ({tg})",
                              f"plot_action_error_vs_budget_{tg}", task_group=tg)
     logger.info("E4.2 -> %s", e42_dir)
 
-    # E4.3
     e43_dir = out_dir / "e4_3_contact_heavy"
     contact_summary = contact_subset_summary(rows, args.main_variant, e43_dir)
     logger.info("E4.3 -> %s", e43_dir)
 
-    # E4.4
     e44_dir = out_dir / "e4_4_distractor"
     distractor_summary = distractor_subset_summary(rows, args.main_variant, e44_dir)
     logger.info("E4.4 -> %s", e44_dir)
 
-    # Rollout figure
     rollout_dir = out_dir / "rollout"
     rollout_name = rollout_figure(
         rows, rollout_dir,
@@ -806,11 +711,9 @@ def main() -> None:
     if rollout_name:
         logger.info("Rollout figure -> %s", rollout_dir / rollout_name)
 
-    # Main paper table
     main_table = write_main_paper_table(rows, out_dir / "main_paper_table.csv",
                                          args.main_variant, args.success_threshold)
 
-    # Combined report
     write_combined_report(out_dir, rows, main_table,
                           contact_summary or {}, distractor_summary or {},
                           rollout_name, args.success_threshold)

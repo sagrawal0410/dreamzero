@@ -1,53 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 2 / Compute — Saliency-proxy maps for the comparison study (E2.1).
+"""Stage 2 compute: Baseline saliency proxies at latent resolution.
 
-Computes, for every example in the Stage-0 manifest, a stack of *baseline*
-saliency proxies that downstream analysis (E2.1 IoU + correlation tables,
-Figure 2 gallery) and Stage-3 budget allocation reuse:
-
-    center            : analytic 2-D Gaussian centred on the latent grid.
-    gripper_proxy     : analytic 2-D Gaussian biased to bottom-centre
-                         (where the end-effector usually lies in DROID views).
-    edges_input       : Sobel-magnitude of the input camera frame, downsampled.
-    clip_features     : norm of the CLIP image-encoder spatial-token output.
-    dit_attention     : norm of the last WAN-DiT transformer block's output
-                         per spatial token, reshaped to a (T_lat, H_lat, W_lat)
-                         "what the model computed strongly" map.
-    optical_flow      : per-pixel optical-flow magnitude of the VAE-decoded
-                         baseline future video, downsampled to the latent grid.
-
-All maps are written at the **latent resolution** so they can be compared to
-the Stage-1 action-causal heatmap directly. The script also writes the
-input camera frame and the decoded baseline future video for Figure 2.
-
-For each example we additionally record:
-    - clip_feas / last_dit_block raw shapes (for reproducibility)
-    - input image resolution (for resizing in Stage 2 / Stage 3)
-
-Example:
-
-    python scripts/stage2/saliency_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 12 \\
-        --output_dir runs/stage2_saliency
-
-Smoke (≈3 min):
-
-    python scripts/stage2/saliency_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_examples 2 \\
-        --output_dir runs/stage2_saliency_smoke
-
-Per-example output:
-
-    runs/stage2_saliency/<example_id>/
-        saliency_maps.npz   - {center, gripper_proxy, edges_input, clip_features,
-                                dit_attention, optical_flow} 3-D arrays in latent shape
-        baseline_input.png
-        baseline_future.mp4   - decoded baseline future video (optical-flow source)
-        meta.json
+Computes CLIP, attention, flow, and heuristic maps for comparison with Stage 1 heatmaps.
 """
 
 from __future__ import annotations
@@ -88,11 +42,6 @@ from _common import (  # noqa: E402
     read_frame,
     reset_causal_state,
 )
-
-
-# ============================================================================
-# Hook helpers — capture activations during a single baseline forward
-# ============================================================================
 
 
 @torch._dynamo.disable
@@ -142,10 +91,8 @@ def _install_capture_hooks(head: Any) -> tuple[dict[str, _CaptureHook], list[Any
         except Exception as e:
             logger.debug("hook on %s failed: %s", name, e)
 
-    # CLIP image encoder
     for path in ("image_encoder", "image_encoder.model"):
         _try_hook("image_encoder", _resolve(head, path)); break
-    # Last DiT transformer block
     blocks = _resolve(head, "model.blocks")
     if blocks is not None and hasattr(blocks, "__len__") and len(blocks) > 0:
         try:
@@ -161,11 +108,6 @@ def _remove_hooks(handles: list[Any]) -> None:
             h.remove()
         except Exception:
             pass
-
-
-# ============================================================================
-# Per-proxy saliency
-# ============================================================================
 
 
 def _gaussian_2d(shape: tuple[int, int], cy_frac: float, cx_frac: float,
@@ -223,7 +165,6 @@ def _saliency_clip(image_encoder_output: torch.Tensor | None,
     if image_encoder_output is None:
         return out
     o = image_encoder_output.float()
-    # Common CLIP shapes: (B, N_tokens, D) with N_tokens = 1 + h*w (CLS + grid).
     if o.ndim != 3:
         return out
     B, N, D = o.shape
@@ -232,7 +173,6 @@ def _saliency_clip(image_encoder_output: torch.Tensor | None,
     grid = norms[1:] if (N - 1) > 0 else norms
     n_grid = int(round(math.sqrt(max(1, grid.size))))
     if n_grid * n_grid != grid.size:
-        # Try common rect aspect 17 × 30 etc.; if the size is composite, factor it.
         for h in range(2, int(math.sqrt(grid.size)) + 2):
             if grid.size % h == 0:
                 w = grid.size // h
@@ -259,13 +199,10 @@ def _saliency_dit(dit_output: torch.Tensor | None,
     B, N, D = o.shape
     feat = o[0].numpy()                            # (N, D)
     norms = np.linalg.norm(feat, axis=-1)          # (N,)
-    # WAN DiT patchifies space by (1, 2, 2) usually. So N = T_lat * (H_lat//2) * (W_lat//2).
-    # Try the obvious factoring:
     h_d = max(1, H // 2); w_d = max(1, W // 2)
     if T * h_d * w_d == norms.size:
         arr = norms.reshape(T, h_d, w_d)
     else:
-        # Fallback: square-ish reshape per time slice.
         per_t = norms.size // max(1, T)
         side = int(round(math.sqrt(max(1, per_t))))
         if side * side != per_t:
@@ -332,11 +269,6 @@ def _saliency_optical_flow(future_frames: np.ndarray | None,
     return _broadcast_to_3d(motion_lat, T)
 
 
-# ============================================================================
-# Per-example computation
-# ============================================================================
-
-
 def compute_example(policy: GrootSimPolicy, entry: dict[str, Any],
                     out_dir: Path, seed: int = 0,
                     camera_for_input: str = "video.exterior_image_1_left",
@@ -344,7 +276,6 @@ def compute_example(policy: GrootSimPolicy, entry: dict[str, Any],
     out_dir.mkdir(parents=True, exist_ok=True)
     head = policy.trained_model.action_head
 
-    # Save input camera frame
     import cv2
     rgb_path = out_dir / "baseline_input.png"
     paths = entry.get("video_paths") or {}
@@ -386,7 +317,6 @@ def compute_example(policy: GrootSimPolicy, entry: dict[str, Any],
             head, video_pred, out_dir / "baseline_future.mp4"
         )
 
-    # Compute proxies
     sal: dict[str, np.ndarray] = {}
     sal["center"] = _saliency_center(latent_shape)
     sal["gripper_proxy"] = _saliency_gripper(latent_shape)
@@ -420,11 +350,6 @@ def compute_example(policy: GrootSimPolicy, entry: dict[str, Any],
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     return meta
-
-
-# ============================================================================
-# Driver
-# ============================================================================
 
 
 def _select_examples(manifest: list[dict[str, Any]], num: int,

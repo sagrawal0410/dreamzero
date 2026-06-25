@@ -1,6 +1,6 @@
 #!/bin/bash
-# Usage:
-#   bash scripts/train/droid_training_wan22_amd.sh
+# AMD training: distill a frozen video-only teacher during joint LoRA fine-tuning.
+# Usage: bash scripts/train/droid_training_wan22_amd.sh
 
 export HYDRA_FULL_ERROR=1
 

@@ -1,41 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0 / E0.1 — Baseline inference sanity for DreamZero-DROID.
+"""Stage 0: Run unmodified DreamZero baseline inference on the task suite.
 
-Loads the manifest produced by `scripts/stage0/build_task_suite.py`, runs
-unmodified DreamZero (no perturbation) on every example, and writes the
-artifacts the rest of Stage 0 needs:
-
-    Per-example  : input observations, instructions, proprio,
-                   predicted action chunks, generated future video
-                   (latents + decoded MP4 if requested), DiT/VAE latents,
-                   per-stage timing, peak GPU memory, NaN/range checks.
-    Stability    : per-example action-chunk variance across `--num_seeds`
-                   runs (same input, different noise), latency variance,
-                   video-latent variance.
-    Aggregate    : summary.json with means/medians/quantiles broken down
-                   by task group, plus a baseline_table.csv suitable for
-                   pasting into a paper appendix.
-    Latent map   : latent_map.json documenting the exact tensor shapes,
-                   spatial / temporal resolution, channel dim, and what
-                   each latent corresponds to (action vs future video,
-                   pre- vs post-VAE).
-
-Example:
-
-    python scripts/stage0/eval_baseline.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --num_seeds 3 \\
-        --save_latents \\
-        --save_actions \\
-        --save_videos \\
-        --profile_latency \\
-        --output_dir runs/stage0_baseline
-
-The script runs as a single process. GrootSimPolicy initialises a 1-rank
-process group (gloo) automatically. For multi-GPU model-parallel inference,
-use the WebSocket server entrypoint instead — this script is intentionally
-the offline, deterministic, debuggable path.
+Records actions, latents, timing, and per-seed stability metrics used as later baselines.
 """
 
 from __future__ import annotations
@@ -72,10 +38,6 @@ from groot.vla.data.schema import EmbodimentTag  # noqa: E402
 from groot.vla.model.n1_5.sim_policy import GrootSimPolicy  # noqa: E402
 
 
-# ----------------------------------------------------------------------------
-# Default modality keys for OXE_DROID — must match training config
-# ----------------------------------------------------------------------------
-
 VIDEO_KEYS = (
     "video.exterior_image_1_left",
     "video.exterior_image_2_left",
@@ -84,11 +46,6 @@ VIDEO_KEYS = (
 LANGUAGE_KEY = "annotation.language.action_text"
 ACTION_KEYS = ("action.joint_position", "action.gripper_position")
 EMBODIMENT_TAG = "oxe_droid"
-
-
-# ----------------------------------------------------------------------------
-# Distributed init for single-process run
-# ----------------------------------------------------------------------------
 
 
 def _init_dist_single_process() -> None:
@@ -100,11 +57,6 @@ def _init_dist_single_process() -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", "0")
     dist.init_process_group(backend="gloo", world_size=1, rank=0)
-
-
-# ----------------------------------------------------------------------------
-# Frame loading
-# ----------------------------------------------------------------------------
 
 
 def _read_frame(mp4_path: str, frame_index: int) -> np.ndarray:
@@ -145,11 +97,6 @@ def _build_obs(entry: dict[str, Any]) -> dict[str, Any]:
     return obs
 
 
-# ----------------------------------------------------------------------------
-# Policy reset between examples — clear causal KV cache so frame index resets
-# ----------------------------------------------------------------------------
-
-
 def _reset_causal_state(policy: GrootSimPolicy) -> None:
     head = getattr(policy.trained_model, "action_head", None)
     if head is None:
@@ -162,11 +109,6 @@ def _reset_causal_state(policy: GrootSimPolicy) -> None:
         head.clip_feas = None
     if hasattr(head, "ys"):
         head.ys = None
-
-
-# ----------------------------------------------------------------------------
-# One inference pass — returns predicted actions and timing
-# ----------------------------------------------------------------------------
 
 
 @dataclass
@@ -250,11 +192,6 @@ def _run_once(policy: GrootSimPolicy, obs: dict[str, Any], seed: int) -> InferRe
     )
 
 
-# ----------------------------------------------------------------------------
-# Optional: decode latent video to MP4 for visual sanity
-# ----------------------------------------------------------------------------
-
-
 def _decode_video(policy: GrootSimPolicy, video_pred: torch.Tensor, out_path: Path) -> bool:
     try:
         import imageio
@@ -286,11 +223,6 @@ def _decode_video(policy: GrootSimPolicy, video_pred: torch.Tensor, out_path: Pa
         return False
 
 
-# ----------------------------------------------------------------------------
-# Aggregate stats helpers
-# ----------------------------------------------------------------------------
-
-
 def _summary_stats(values: list[float]) -> dict[str, float]:
     if not values:
         return {"n": 0}
@@ -305,11 +237,6 @@ def _summary_stats(values: list[float]) -> dict[str, float]:
         "max": float(np.max(arr)),
         "std": float(np.std(arr)),
     }
-
-
-# ----------------------------------------------------------------------------
-# Main eval driver
-# ----------------------------------------------------------------------------
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -346,7 +273,6 @@ def evaluate(args: argparse.Namespace) -> None:
     peak_mem_samples: list[float] = []
     nan_count = 0
 
-    # Per-task-group accumulators
     by_group: dict[str, list[dict[str, Any]]] = {}
 
     for i, entry in enumerate(manifest):
@@ -389,7 +315,6 @@ def evaluate(args: argparse.Namespace) -> None:
         if any(r.has_nan for r in runs):
             nan_count += 1
 
-        # Save artifacts using the seed-0 run as canonical
         canonical = runs[0]
 
         if args.save_actions:
@@ -400,7 +325,6 @@ def evaluate(args: argparse.Namespace) -> None:
                 gt_action_chunk=np.asarray(entry.get("gt_action_chunk", []), dtype=np.float64),
             )
 
-        # Persist obs (downsampled — frames are uint8; this is small for 1 frame).
         if args.save_obs:
             np.savez(
                 out_dir / "obs" / f"{ex_id}.npz",
@@ -480,7 +404,6 @@ def evaluate(args: argparse.Namespace) -> None:
             f"{action_l1:.4f}" if action_l1 is not None else "n/a",
         )
 
-    # Aggregate
     summary = {
         "checkpoint": args.checkpoint,
         "task_suite": str(manifest_path),
@@ -514,7 +437,6 @@ def evaluate(args: argparse.Namespace) -> None:
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "per_example.json").write_text(json.dumps(per_example_records, indent=2))
 
-    # Paper-ready CSV
     with (out_dir / "baseline_table.csv").open("w") as f:
         w = csv.writer(f)
         w.writerow([
@@ -541,11 +463,6 @@ def evaluate(args: argparse.Namespace) -> None:
                 summary["latency_s"].get("p90", math.nan),
                 summary["peak_gpu_mb"].get("mean", math.nan),
                 summary["nan_count"])
-
-
-# ----------------------------------------------------------------------------
-# Latent-map artifact
-# ----------------------------------------------------------------------------
 
 
 def _build_latent_map(policy: GrootSimPolicy, run: InferResult) -> dict[str, Any]:
@@ -594,11 +511,6 @@ def _build_latent_map(policy: GrootSimPolicy, run: InferResult) -> dict[str, Any
         },
     }
     return map_
-
-
-# ----------------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------------
 
 
 def main() -> None:

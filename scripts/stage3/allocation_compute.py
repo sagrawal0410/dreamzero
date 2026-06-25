@@ -1,55 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 3 / Compute — CALA-WAM matched-budget allocation sweep (E3.1, E3.2).
+"""Stage 3 compute: Matched-budget latent retention sweep.
 
-Implements the **method evaluation pass**. For every example × method × budget
-× variant we (a) build a retention mask using that method's importance map,
-(b) compress the *non-retained* latent blocks with a chosen operator, (c) run
-one perturbed forward, and (d) record action / video error vs the unperturbed
-baseline + an approximate latency proxy.
-
-Methods (each produces a 2-D importance map over the latent grid):
-
-    random              — i.i.d. uniform per cell.
-    uniform             — flat (every cell equal; budget chooses a regular grid).
-    center              — analytic Gaussian, image-centre.
-    gripper             — analytic Gaussian, bottom-centre proxy.
-    object              — alias for `clip_features` from Stage 2.
-    flow                — alias for `optical_flow` from Stage 2.
-    attention           — alias for `dit_attention` from Stage 2.
-    edges               — alias for `edges_input` from Stage 2.
-    action_causal       — Stage-1 primary action heatmap (CALA-WAM signal).
-    cala_wam_hybrid     — α · action_causal + (1-α) · video_causal,
-                          combining action and future-video sensitivity.
-
-Variants (how to compress the *non-retained* blocks):
-
-    A_hard_retention    — full identity for top-k, local_mean for rest.
-    B_soft_fidelity     — three tiers: identity > blur_k3 > local_mean.
-    C_temporal_cache    — non-retained blocks replaced by previous-frame ys.
-    D_global_summary    — non-retained blocks replaced by their pooled mean.
-
-Each row in the output table records:
-
-    example_id, task_group, role, method, variant, budget_pct,
-    fraction_retained_actual, action_l2, action_first, action_gripper,
-    action_cosine, video_l2, perturbation_norm_relative,
-    forward_elapsed_s, approx_latency_ratio = budget_pct/100,
-    valid (no NaN, shapes match)
-
-Example:
-
-    python scripts/stage3/allocation_compute.py \\
-        --checkpoint /workspace/checkpoints/DreamZero-DROID \\
-        --task_suite runs/stage0_suite/manifest.json \\
-        --maps_dir runs/stage1_maps \\
-        --saliency_dir runs/stage2_saliency \\
-        --num_examples 12 \\
-        --budgets 100,75,50,25,12.5 \\
-        --methods action_causal,cala_wam_hybrid,random,uniform,center,gripper,object,flow,attention \\
-        --variants A_hard_retention,B_soft_fidelity,C_temporal_cache \\
-        --output_dir runs/stage3_alloc
-
-The budget=100 column = baseline action error = 0; we keep it as a calibration row.
+Retains top-importance blocks per method and measures action/video error vs budget.
 """
 
 from __future__ import annotations
@@ -91,11 +43,6 @@ from _common import (  # noqa: E402
 )
 
 import perturbation_suite as ps  # noqa: E402
-
-
-# ============================================================================
-# Importance-map providers per method
-# ============================================================================
 
 
 def _gaussian_2d(shape: tuple[int, int], cy_frac: float, cx_frac: float,
@@ -178,11 +125,6 @@ def _load_method_map(method: str,
     return None
 
 
-# ============================================================================
-# Retention mask + compression variants
-# ============================================================================
-
-
 def _retention_mask_top_k(importance: np.ndarray, budget_pct: float) -> np.ndarray:
     """Boolean mask: True where retained (top-k%)."""
     flat = np.nan_to_num(importance.astype(np.float64), nan=0.0).flatten()
@@ -251,7 +193,6 @@ def _apply_variant_B(ys_base: torch.Tensor, importance: np.ndarray,
     drop_mask = ~keep_mask
 
     full = lat_ch.float()
-    # Blur layer (depthwise 3×3)
     B, C, T, H, W = full.shape
     weight = torch.ones((C, 1, 1, 3, 3), dtype=full.dtype, device=full.device) / 9.0
     blurred = F.conv3d(full, weight, padding=(0, 1, 1), groups=C)
@@ -306,11 +247,6 @@ def _build_perturbed_ys(variant: str, ys_base: torch.Tensor, importance: np.ndar
     raise ValueError(f"Unknown variant {variant}")
 
 
-# ============================================================================
-# Metrics
-# ============================================================================
-
-
 def _action_metrics(base_chunk: np.ndarray, pert_chunk: np.ndarray) -> dict[str, float]:
     if base_chunk.shape != pert_chunk.shape or base_chunk.size == 0:
         return {"action_l2": float("nan"), "action_first": float("nan"),
@@ -346,11 +282,6 @@ def _latent_perturbation_norm(ys_base: torch.Tensor, ys_pert: torch.Tensor, ch0:
     return diff_norm / base_norm
 
 
-# ============================================================================
-# Per-example sweep
-# ============================================================================
-
-
 def sweep_example(policy: GrootSimPolicy,
                   entry: dict[str, Any],
                   stage1_arrays: dict[str, np.ndarray] | None,
@@ -363,14 +294,12 @@ def sweep_example(policy: GrootSimPolicy,
     out_dir.mkdir(parents=True, exist_ok=True)
     head = policy.trained_model.action_head
 
-    # Baseline (also gives us ys + action chunk + video_pred)
     obs = build_obs(entry)
     baseline = ps.capture_baseline(policy, obs, seed)
     T_lat, H_lat, W_lat = int(baseline.ys.shape[2]), int(baseline.ys.shape[3]), int(baseline.ys.shape[4])
     latent_shape = (T_lat, H_lat, W_lat)
     rng = np.random.default_rng(seed)
 
-    # Compute importance maps once per method
     importance_per_method: dict[str, np.ndarray] = {}
     for m in methods:
         imp = _load_method_map(
@@ -385,7 +314,6 @@ def sweep_example(policy: GrootSimPolicy,
                 if imp.ndim == 3 and imp.shape[1:] == latent_shape[1:]:
                     pass
                 else:
-                    # Resize 2D map to (H_lat, W_lat) and broadcast over T_lat
                     arr2 = np.nanmean(imp, axis=0) if imp.ndim == 3 else imp
                     import cv2
                     arr2 = cv2.resize(arr2.astype(np.float32),
@@ -397,7 +325,6 @@ def sweep_example(policy: GrootSimPolicy,
                 continue
         importance_per_method[m] = imp.astype(np.float32)
 
-    # Optional: prev-frame ys for variant C
     prev_ys: torch.Tensor | None = None
     if "C_temporal_cache" in variants:
         prev_ys = ps.fetch_prev_frame_ys(policy, entry, lag=1, seed=seed)
@@ -454,7 +381,6 @@ def sweep_example(policy: GrootSimPolicy,
                     )),
                 })
 
-    # Persist per-example rows
     fieldnames = list(rows[0].keys()) if rows else []
     if fieldnames:
         with (out_dir / "rows.csv").open("w") as f:
@@ -474,11 +400,6 @@ def sweep_example(policy: GrootSimPolicy,
         "n_rows": len(rows),
     }, indent=2))
     return rows
-
-
-# ============================================================================
-# Driver
-# ============================================================================
 
 
 def _select_examples(manifest: list[dict[str, Any]], num: int,
@@ -615,7 +536,6 @@ def main() -> None:
             logger.error("[%s] sweep failed: %s", entry["example_id"], e, exc_info=True)
             continue
 
-    # Aggregate
     fieldnames = list(all_rows[0].keys()) if all_rows else []
     if fieldnames:
         with (out_dir / "all_rows.csv").open("w") as f:
