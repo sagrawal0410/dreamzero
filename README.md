@@ -1,4 +1,12 @@
-Improved DreamZero joint video-action conditioning and zero-shot capabilities by 5% via introducing action conditioning through custom AMD pipelines with adaptive trust-region based token weighting for maximizing joint dynamics-action priors in the model
+Improving DreamZero joint video-action conditioning and zero-shot capabilities via introducing action conditioning through custom AMD pipelines with adaptive trust-region based token weighting for maximizing joint dynamics-action priors in the model
+
+This fork adds two tracks on top of base DreamZero: AMD training (better joint video–action fine-tuning) and CALA-WAM (analysis of which conditioning latents matter for actions).
+
+AMD training addresses video-prior drift during joint LoRA fine-tuning by distilling the student toward a frozen video-only teacher (LoRA off, no action/state). Trust-region based token weighting extends this with spatial weights conceptually requiring strong distillation on static regions to maintain dynamic priors and weak on high-motion regions. Scripts: droid_training_wan22_amd.sh and droid_training_wan22_amd_trust_region.sh. Training-time paradigm.
+
+CALA-WAM (Stages 0–5) is an offline DROID evaluation pipeline on a stratified task suite (contact, distractor, global-context, static-background, easy tasks). Stage 0 builds the suite and picks perturbation operators. Stage 1 produces action-causal heatmaps via block-wise latent perturbation. Stage 2 compares those maps to saliency proxies (CLIP, attention, flow, etc.). Stage 3 sweeps matched-budget latent retention (100→12.5%) across importance methods and compression variants. Stage 4 replays trajectories under retention masks. Stage 5 distills heatmaps into a lightweight allocator. Run all stages with bash scripts/run_cala_wam_pipeline.sh (SMOKE=1 for a quick pass, STAGE=N for one stage). Inference-time weighting (adaptive compute allocation).
+
+
 
 
 # NVIDIA DreamZero: World Action Models Are Zero-Shot Policies
